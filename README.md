@@ -15,6 +15,10 @@
 
 _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权给phisap项目使用，ShintoKosei保留所有权利_
 
+</div>
+
+---
+
 ## 此版本为fork版
 
 需要原版phisap的，请查看[kvarenzn/phisap](https://github.com/kvarenzn/phisap)
