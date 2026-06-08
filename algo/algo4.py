@@ -146,6 +146,14 @@ class PointerManager:
             self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts)
             self.last_active_ts[ptr.id] = self.current_ts
             return ptr.id, True
+        
+        print(f"\n[CRASH DEBUG] 触控点耗尽。崩溃时间戳: {self.current_ts} ms")
+        print("当前【占用中】的指针状态 (NoteID -> PointerID):")
+        for nid, record in self.occupied.items():
+            print(f"  - 音符ID {nid} 占用了手指 {record.id} (分配于 {record.timestamp} ms, 坐标: {record.position})")
+        print(f"当前【闲置】的指针 (idle): {self.idle}")
+        print(f"当前【未释放】的缓存指针 (unused): {self.unused}")
+        
         raise RuntimeError(f'no free pointers @ {self.current_ts}')
 
     def free(self, note: SemiNote) -> None:
@@ -307,15 +315,13 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         SemiNote(SemiNoteType.HOLD_START, adj_pos, current_note_id, adj_rot))
                     dense_frame_sizes[base_ms] += 1
                     p_touch = adj_pos
-                    for off in range(1, hold_ms + 1, sample_delay):
+                    for off in range(1, hold_ms, sample_delay):
                         t = (base_ms + off) / 1000
                         ang = line.angle @ t
                         rot = cmath.exp(ang * 1j)
                         pos = line.pos(t, adj_offset)
                         dense_frame_sizes[base_ms + off] += 1
                         area_t = JudgeArea(pos, rot, screen.width, screen.height)
-                        if area_t.poly.contains(Point(p_touch.real, p_touch.imag)):
-                            continue
                         valid_zone_t = area_t.get_valid_poly(screen_poly, pause_poly)
                         if not valid_zone_t.is_empty:
                             orig_point = Point(pos.real, pos.imag)
@@ -369,12 +375,23 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     
     result: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
     for timestamp, frame in track(sorted(frames.items()), description='规划触控事件...', console=console):
-        pointers.current_ts = timestamp
         to_free: list[SemiNote] = []
         must_notes: list[SemiNote] = []
         may_notes: list[SemiNote] = []
         active_never: list[SemiNote] = []
         passive_notes: list[SemiNote] = []
+        confirmed_pointers: dict[PointerID, Position] = {}
+        
+        pointers.current_ts = timestamp
+        
+        # ==================== 新增 DEBUG 代码 ====================
+        # 当已占用的手指数量接近上限时，输出警告和当前帧音符详情
+        if len(pointers.occupied) >= pointers_count - 2:
+            console.print(f"[bold red]⚠️ 触控点即将耗尽！时间戳: {timestamp} ms (已占用: {len(pointers.occupied)}/{pointers_count})[/bold red]")
+            console.print("当前帧待处理的音符:")
+            for note in frame:
+                console.print(f"  - NoteID: {note.id}, 类型: {note.type}, 坐标: {note.position}")
+        # ========================================================
         
         for note in frame:
             if note.type in (SemiNoteType.TAP, SemiNoteType.HOLD_START):
@@ -409,6 +426,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                             must_targets[i] = Position(pt_i.x, pt_i.y)
                             must_targets[j] = Position(pt_j.x, pt_j.y)
                             changed = True
+                            console.print(
+                                f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => note(pos={must_targets[i]}) | note(pos={must_targets[j]})[/yellow]"
+                            )
                         else:
                             inter_zone = active_polys[i].intersection(active_polys[j])
                             if not inter_zone.is_empty:
@@ -419,6 +439,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                                 active_polys[i] = inter_zone
                                 active_polys[j] = inter_zone
                                 changed = True
+                                console.print(
+                                f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => 2x note(pos={target_c})[/yellow]"
+                            )
             if not changed:
                 break
         
@@ -428,26 +451,30 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             result[timestamp].append(VirtualTouchEvent(target, act, pid))
             if note.type == SemiNoteType.TAP:
                 to_free.append(note)
+            confirmed_pointers[pid] = target
         for note in may_notes:
             pid, is_down = pointers.alloc(note, new=False)
             act = TouchAction.DOWN if is_down else TouchAction.MOVE
             result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
+            confirmed_pointers[pid] = note.position
         for note in active_never:
             if note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END):
                 pid, _ = pointers.alloc(note)
                 result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
                 if note.type == SemiNoteType.FLICK_END:
                     to_free.append(note)
+                confirmed_pointers[pid] = note.position
             elif note.type == SemiNoteType.HOLD_END:
                 if note.id in pointers.occupied:
                     pid, _ = pointers.alloc(note)
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
                     to_free.append(note)
+                    confirmed_pointers[pid] = note.position
         active_touches = [ptr.position for ptr in pointers.occupied.values()]
         for note in passive_notes:
             poly_n = JudgeArea(note.position, note.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
             is_covered = False
-            for p_touch in active_touches:
+            for p_touch in confirmed_pointers.values():
                 if poly_n.contains(Point(p_touch.real, p_touch.imag)):
                     is_covered = True
                     break
@@ -463,10 +490,12 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     act = TouchAction.DOWN if is_down else TouchAction.MOVE
                     result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                     to_free.append(note)
+                    confirmed_pointers[pid] = note.position
                 elif note.type == SemiNoteType.HOLD:
                     pid, is_down = pointers.alloc(note, new=False)
                     act = TouchAction.DOWN if is_down else TouchAction.MOVE
                     result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
+                    confirmed_pointers[pid] = note.position
         
         for note_to_free in to_free:
             pointers.free(note_to_free)
