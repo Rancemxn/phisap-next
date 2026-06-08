@@ -21,9 +21,9 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
 
 ## 此版本为fork版
 
-需要原版phisap的，请查看[kvarenzn/phisap](https://github.com/kvarenzn/phisap)
+如果需要原版phisap，请查看[kvarenzn/phisap](https://github.com/kvarenzn/phisap)
 
-* 此项目对原项目进行维护，部分代码由语言模型生成，同时进行人工修改
+* 此项目对原项目进行维护。部分代码由语言模型生成，同时进行手动修改
 
 * 具体改动下滑见更新日志
 
