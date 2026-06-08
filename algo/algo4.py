@@ -205,7 +205,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
 
         for dt in range(1, 16):
             for sign in (-1, 1):
-                new_time = base_sec + (dt_ms * 0.001) * sign
+                new_time = base_sec + (dt * 0.001) * sign
                 new_lp = line_obj.position @ new_time
                 new_alpha = line_obj.angle @ new_time
                 new_rot: Vector = cmath.exp(new_alpha * 1j)
