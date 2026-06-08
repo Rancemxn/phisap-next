@@ -26,7 +26,6 @@ class ScrcpyController:
     control_socket: socket.socket
     server_process: subprocess.Popen
     streaming_collector: threading.Thread
-    control_collector: threading.Thread
     device_width: int
     device_height: int
     collector_running: bool
@@ -65,6 +64,7 @@ class ScrcpyController:
             'com.genymobile.scrcpy.Server',
             server_version,
             f'scid={self.session_id}',
+            'send_dummy_byte=false',
             'log_level=info',
             # 'video_codec=h264',  # TODO: 主界面加入相关设置
             'audio=false',
@@ -106,36 +106,26 @@ class ScrcpyController:
                 print(e.with_traceback(None))
                 self.collector_running = False
 
-        def ctrlmsg_receiver():
-            '''另一个垃圾收集器
-            收集的是scrcpy-server传来的控制事件的信息，
-            比如屏幕旋转事件等'''
-            try:
-                while self.collector_running:
-                    _msg_type = self.control_socket.recv(1)
-                    size = int.from_bytes(self.control_socket.recv(4), 'big')
-                    self.control_socket.recv(size)
-            except Exception as e:
-                print(e.with_traceback(None))
-                self.collector_running = False
 
         _device_name = self.video_socket.recv(64)  # sendDeviceMeta
 
         # streamer.writeVideoHeader(device.getScreenInfo().getVideoSize())
-        codec_id = self.video_socket.recv(4).decode()
-        self.device_width = int.from_bytes(self.video_socket.recv(4), 'big')
-        self.device_height = int.from_bytes(self.video_socket.recv(4), 'big')
+        # scrcpy 4.0: writeVideoHeader sends codec id (4 bytes int),
+        # then writeSessionMeta sends flags(4) + width(4) + height(4)
+        self.video_socket.recv(4)  # codec id (unused)
+        session_meta = self.video_socket.recv(12)  # flags + width + height
+        self.device_width = int.from_bytes(session_meta[4:8], 'big')
+        self.device_height = int.from_bytes(session_meta[8:12], 'big')
+        codec_id = '?'  # placeholder, not used downstream
 
         print('[client]', f'device_size = {self.device_width}x{self.device_height}, codec_id = {codec_id}')
 
         self.streaming_collector = threading.Thread(target=streaming_decoder, daemon=True)
         self.streaming_collector.start()
 
-        self.control_collector = threading.Thread(target=ctrlmsg_receiver, daemon=True)
-        self.control_collector.start()
 
     def touch(self, x: int, y: int, action: TouchAction, pointer_id: int) -> None:
-        self.control_socket.send(
+        self.control_socket.sendall(
             struct.pack(
                 '!bbQiiHHHII',
                 2,  # type: SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
@@ -156,6 +146,11 @@ class ScrcpyController:
         time.sleep(delay)
         self.touch(self.device_width >> 1, self.device_height >> 1, TouchAction.UP, pointer_id)
 
+    def reset_touches(self) -> None:
+        """Send UP events for all possible finger IDs to release dangling touches."""
+        for pointer_id in range(10):
+            self.touch(0, 0, TouchAction.UP, pointer_id)
+
     def clean(self) -> None:
         self.collector_running = False
         self.server_process.kill()
@@ -164,8 +159,9 @@ class ScrcpyController:
         self.skt.close()
 
     def preprocess(self, screen: ScreenUtil, answer: RawAnswerType) -> list[GranularAnswerItem]:
-        height = self.device_height
-        width = self.device_width * screen.width // screen.height
+        scale = min(self.device_width / screen.width, self.device_height / screen.height)
+        width = round(screen.width * scale)
+        height = round(screen.height * scale)
         offset_x = (self.device_width - width) >> 1
         offset_y = (self.device_height - height) >> 1
         x_scale = width / screen.width
@@ -287,6 +283,9 @@ class HIDController:
 
     def clean(self) -> None:
         self.disconnect()
+
+    def reset_touches(self) -> None:
+        pass
 
     def connect(self) -> None:
         self._register_hid()

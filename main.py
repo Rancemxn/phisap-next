@@ -4,7 +4,7 @@ import json
 import typing
 import zipfile
 from pathlib import Path
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication,
     QWidget,
     QHBoxLayout,
@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QMessageBox,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QSettings
 
 from rich.console import Console
 from catalog import Catalog
@@ -45,11 +45,11 @@ from pgr import PgrChart
 from pec import PecChart
 from rpe import RpeChart
 
-PHISAP_VERSION = '0.19'
+PHISAP_VERSION = '0.20'
 
 
 class ExtractPackageWorker(QThread):
-    processUpdate = pyqtSignal(int, int, int)  # phase, current, max
+    processUpdate = Signal(int, int, int)  # phase, current, max
     packagePath: str
     running: bool
 
@@ -243,6 +243,11 @@ class MainWindow(QWidget):
     algo2TargetScore: QSpinBox
     algo2StrictMode: QCheckBox
     algo2ContinueWhenFailed: QCheckBox
+    algo4FlickStart: QSpinBox
+    algo4FlickEnd: QSpinBox
+    algo4FlickDirection: QButtonGroup
+    algo4SampleDelay: QSpinBox
+    algo4ContinueWhenFailed: QCheckBox
 
     preferCache: QCheckBox
     mainModeSelectTabs: QTabWidget
@@ -278,6 +283,11 @@ class MainWindow(QWidget):
         'algo2TargetScore': 1000000,
         'algo2StrictMode': False,
         'algo2ContinueWhenFailed': False,
+        'algo4_flick_start': ('algo4FlickStart', -20),
+        'algo4_flick_end': ('algo4FlickEnd', 20),
+        'algo4_flick_direction': ('algo4FlickDirection', 0),
+        'algo4_sample_delay': ('algo4SampleDelay', 5),
+        'algo4_continue_when_failed': ('algo4ContinueWhenFailed', False),
         'customChartPath': '',
         'preferCache': True,
         'syncMode': ('syncModeSelector', 0),
@@ -473,6 +483,47 @@ class MainWindow(QWidget):
 
         algo3ConfigView = QWidget()
         self.algorithmSelectorTabs.addTab(algo3ConfigView, self.tr('Rebelli Algo'))
+
+        algo4ConfigView = QWidget()
+        self.algorithmSelectorTabs.addTab(algo4ConfigView, self.tr('Optimization Algo'))
+        algo4ConfigViewLayout = QVBoxLayout()
+        algo4ConfigView.setLayout(algo4ConfigViewLayout)
+        line1 = QHBoxLayout()
+        algo4ConfigViewLayout.addLayout(line1)
+        line1.addWidget(QLabel(text=self.tr('Flick start at:')))
+        self.algo4FlickStart = QSpinBox()
+        self.algo4FlickStart.setRange(-1145141919, 1145141919)
+        line1.addWidget(self.algo4FlickStart)
+        line1.addWidget(QLabel(text=self.tr('ms')))
+        line2 = QHBoxLayout()
+        algo4ConfigViewLayout.addLayout(line2)
+        line2.addWidget(QLabel(text=self.tr('Flick end at:')))
+        self.algo4FlickEnd = QSpinBox()
+        self.algo4FlickEnd.setRange(-1145141919, 1145141919)
+        line2.addWidget(self.algo4FlickEnd)
+        line2.addWidget(QLabel(text=self.tr('ms')))
+        line3 = QHBoxLayout()
+        algo4ConfigViewLayout.addLayout(line3)
+        self.algo4FlickDirection = QButtonGroup()
+        line3.addWidget(QLabel(text=self.tr('Flick direction:')))
+        direc1 = QRadioButton(text=self.tr('Perpend. to'))
+        direc2 = QRadioButton(text=self.tr('Parallel to'))
+        line3.addWidget(direc1)
+        line3.addWidget(direc2)
+        self.algo4FlickDirection.addButton(direc1, id=0)
+        self.algo4FlickDirection.addButton(direc2, id=1)
+        direc1.setChecked(True)
+        line4 = QHBoxLayout()
+        algo4ConfigViewLayout.addLayout(line4)
+        line4.addWidget(QLabel(text=self.tr('Sample delay:')))
+        self.algo4SampleDelay = QSpinBox()
+        self.algo4SampleDelay.setRange(1, 17)
+        line4.addWidget(self.algo4SampleDelay)
+        line4.addWidget(QLabel(text=self.tr('ms')))
+        line5 = QHBoxLayout()
+        algo4ConfigViewLayout.addLayout(line5)
+        self.algo4ContinueWhenFailed = QCheckBox(text=self.tr('Ignore allocation errors'))
+        line5.addWidget(self.algo4ContinueWhenFailed)
 
         self.mainModeSelectTabs = QTabWidget()
         self.mainLayout.addWidget(self.mainModeSelectTabs)
@@ -728,6 +779,11 @@ class MainWindow(QWidget):
             algo2_target_score=self.algo2TargetScore.value(),
             algo2_strict_mode=self.algo2StrictMode.isChecked(),
             algo2_continue_when_failed=self.algo2ContinueWhenFailed.isChecked(),
+            algo4_flick_start=self.algo4FlickStart.value(),
+            algo4_flick_end=self.algo4FlickEnd.value(),
+            algo4_flick_direction=self.algo4FlickDirection.checkedId(),
+            algo4_sample_delay=self.algo4SampleDelay.value(),
+            algo4_continue_when_failed=self.algo4ContinueWhenFailed.isChecked(),
         )
 
     def process(self) -> None:
@@ -742,8 +798,10 @@ class MainWindow(QWidget):
                 import algo.algo1 as algo
             elif algoIndex == 1:
                 import algo.algo2 as algo
-            else:
+            elif algoIndex == 2:
                 import algo.algo3 as algo
+            else:
+                import algo.algo4 as algo
             screen, ans = algo.solve(chart, self.getAlgorithmConfigureDict(), self.console)
             if self.saveResult.isChecked():
                 self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
@@ -789,6 +847,10 @@ class MainWindow(QWidget):
         if serial == self.tr('No device found'):
             return
 
+        # skip recreation if the same serial is already in use
+        if self.controller and self.controller.serial == serial:
+            return
+
         backend = self.backendSelection.checkedId()
         if backend == 0:
             self.controller = ScrcpyController(serial)
@@ -796,65 +858,75 @@ class MainWindow(QWidget):
             self.controller = HIDController((self.deviceWidthInput.value(), self.deviceHeightInput.value()), serial)
 
     def autoplay(self) -> None:
-        self.saveSettings()
-        content, chart = self.loadChart()
-        algoIndex = self.algorithmSelectorTabs.currentIndex()
-        ans: RawAnswerType
-        screen: ScreenUtil
-        cacheData: bytes | None = None
+        try:
+            self.saveSettings()
+            content, chart = self.loadChart()
+            algoIndex = self.algorithmSelectorTabs.currentIndex()
+            ans: RawAnswerType
+            screen: ScreenUtil
+            cacheData: bytes | None = None
 
-        if self.preferCache.isChecked():
-            cacheData = self.cacheManager.find_cache_for_content(content)
+            if self.preferCache.isChecked():
+                cacheData = self.cacheManager.find_cache_for_content(content)
 
-        if cacheData is not None:
-            screen, ans = load_data(cacheData)
-        else:
-            if algoIndex == 0:
-                import algo.algo1 as algo
-            elif algoIndex == 1:
-                import algo.algo2 as algo
+            if cacheData is not None:
+                screen, ans = load_data(cacheData)
             else:
-                import algo.algo3 as algo
-            screen, ans = algo.solve(chart, self.getAlgorithmConfigureDict(), self.console)
-            self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
+                if algoIndex == 0:
+                    import algo.algo1 as algo
+                elif algoIndex == 1:
+                    import algo.algo2 as algo
+                elif algoIndex == 2:
+                    import algo.algo3 as algo
+                else:
+                    import algo.algo4 as algo
+                screen, ans = algo.solve(chart, self.getAlgorithmConfigureDict(), self.console)
+                self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
 
-        assert self.controller is not None
-        self.controller.connect()
+            assert self.controller is not None
+            self.controller.connect()
 
-        self.delayLabel.setText(self.tr('Offset:'))
-        delay = None
-        adaptedAns = self.controller.preprocess(screen, ans)
-        ansIter = iter(adaptedAns)
-        if self.syncModeSelector.checkedId() == 0:
-            # Manual
-            delay = -adaptedAns[0][0]
-            self.lastDelayValue = self.delayInput.value()
+            self.delayLabel.setText(self.tr('Offset:'))
+            delay = None
+            adaptedAns = self.controller.preprocess(screen, ans)
+            ansIter = iter(adaptedAns)
+            if self.syncModeSelector.checkedId() == 0:
+                # Manual
+                delay = -adaptedAns[0][0]
+                self.lastDelayValue = self.delayInput.value()
 
-            def waitForBegin():
-                if not self.autoplayWorker:
-                    return
+                def waitForBegin():
+                    if not self.autoplayWorker:
+                        return
+                    self.prepareBeforeAutoplay()
+
+                self.goButton.setText(self.tr('Go!'))
+                self.goButton.clicked.disconnect(self.autoplay)
+                self.goButton.clicked.connect(waitForBegin)
+            else:
+                # Delay
+                self.lastDelayValue = self.delayInput.value()
+                delay = self.lastDelayValue
+                self.controller.tap_center()
+        
+            backend = self.backendSelection.checkedId()
+            playSpeed = self.playSpeedInput.value()
+            if backend == 0:
+                self.autoplayWorker = AutoplayScrcpyWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
+            elif backend == 1:
+                self.autoplayWorker = AutoplayHIDWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
+
+            if self.syncModeSelector.checkedId() == 1:
                 self.prepareBeforeAutoplay()
 
-            self.goButton.setText(self.tr('Go!'))
-            self.goButton.clicked.disconnect(self.autoplay)
-            self.goButton.clicked.connect(waitForBegin)
-        else:
-            # Delay
-            self.lastDelayValue = self.delayInput.value()
-            delay = self.lastDelayValue
-            self.controller.tap_center()
-        
-        backend = self.backendSelection.checkedId()
-        playSpeed = self.playSpeedInput.value()
-        if backend == 0:
-            self.autoplayWorker = AutoplayScrcpyWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
-        elif backend == 1:
-            self.autoplayWorker = AutoplayHIDWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
 
-        if self.syncModeSelector.checkedId() == 1:
-            self.prepareBeforeAutoplay()
-
-
+        except Exception:
+            self.console.print_exception(show_locals=False)
+            # Restore UI state
+            self.goButton.clicked.disconnect()
+            self.goButton.clicked.connect(self.autoplay)
+            self.onSyncModeChanged(self.syncModeSelector.checkedId())
+            self.delayLabel.setText(self.tr("Delay:"))
     def prepareBeforeAutoplay(self) -> None:
         assert self.autoplayWorker is not None
         self.autoplayWorker.start()
@@ -869,6 +941,10 @@ class MainWindow(QWidget):
         self.delayInput.valueChanged.connect(self.autoplayWorker.onDelayChanged)
 
     def cleanAfterAutoplay(self) -> None:
+        # Release any dangling pointers left in DOWN state from mid-stop
+        if self.controller:
+            self.controller.reset_touches()
+        
         self.goButton.clicked.disconnect()
         self.goButton.clicked.connect(self.autoplay)
         self.onSyncModeChanged(self.syncModeSelector.checkedId())
@@ -879,7 +955,7 @@ class MainWindow(QWidget):
 
 
 if __name__ == '__main__':
-    from PyQt5.QtCore import QTranslator, QLocale
+    from PySide6.QtCore import QTranslator, QLocale
     import sys
 
     app = QApplication(sys.argv)

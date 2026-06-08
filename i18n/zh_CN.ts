@@ -249,6 +249,11 @@
         <translation>极端算法</translation>
     </message>
     <message>
+        <location filename="../main.py" line="488"/>
+        <source>Optimization Algo</source>
+        <translation>优化算法</translation>
+    </message>
+    <message>
         <location filename="../main.py" line="422"/>
         <source>Ignore allocation errors</source>
         <translation>规划出现问题时强制继续</translation>

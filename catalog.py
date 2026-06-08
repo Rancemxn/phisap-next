@@ -93,4 +93,28 @@ class Catalog:
             raise RuntimeError(f'type {obj_type} not supported now.')
 
 
+    def get_asset_name(self, dep_key: str) -> str | None:
+        return self.fname_map.get(dep_key)
+
+    def get_chart_entries(self) -> list[tuple[str, str]]:
+        result = []
+        for e in self.entries:
+            pk = e.get("primaryKey")
+            dk = e.get("dependencyKey")
+            if isinstance(pk, str) and isinstance(dk, str):
+                if pk.startswith("Assets/Tracks/") and pk.endswith(".json"):
+                    result.append((pk, dk))
+        return result
+
+    def get_track_entries(self) -> list[tuple[str, str]]:
+        result = []
+        for e in self.entries:
+            pk = e.get("primaryKey")
+            dk = e.get("dependencyKey")
+            if isinstance(pk, str) and isinstance(dk, str):
+                if pk.startswith("Assets/Tracks/") or pk.startswith("avatar."):
+                    result.append((pk, dk))
+        return result
+
+
 __all__ = ['Catalog']

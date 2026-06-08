@@ -1,6 +1,8 @@
 import os.path
 import pathlib
+import re
 from typing import IO, Optional
+from struct import unpack
 
 from enum import Enum
 from rich.console import Console
@@ -118,6 +120,10 @@ COMMON_STRINGS = {
     1152: 'FileSize',
     1161: 'Hash128',
 }
+
+# UnityFS encryption signature
+UNITY3D_SIGNATURE = b"#$unity3dchina!@"
+
 
 
 class TypeTreeNode:
@@ -644,7 +650,7 @@ class FileReader(BinaryReader):
         self.skip(4)
 
         if version >= 22:
-            if file_size < 48:
+            if length < 48:
                 return False
             self.skip(4)
             file_size = self.u64
@@ -733,6 +739,11 @@ class BundleFile:
         self.header.version = reader.u32
         self.header.unity_version = reader.cstr()
         self.header.unity_revision = reader.cstr()
+        self.unity_version_tuple = self._parse_version(self.header.unity_revision)
+        self.uses_block_alignment = False
+        self.data_flags = self.header.flags if hasattr(self.header, 'flags') else 0
+        self.decryptor = None
+        self._is_new_format = False
 
         signature = self.header.signature
 
@@ -745,11 +756,22 @@ class BundleFile:
             self.header.compressed_blocks_info_size = reader.u32
             self.header.uncompressed_blocks_info_size = reader.u32
             self.header.flags = reader.u32
+            self.data_flags = self.header.flags
             if signature != 'UnityFS':
                 reader.skip(1)
 
+            self._handle_encryption(reader)
+
             if self.header.version >= 7:
                 reader.align(16)
+                self.uses_block_alignment = True
+            elif self.unity_version_tuple >= (2019, 4):
+                pre_align = reader.pos
+                align_data = reader.read((16 - pre_align % 16) % 16)
+                if any(align_data):
+                    reader.pos = pre_align
+                else:
+                    self.uses_block_alignment = True
 
             if self.header.flags & 0x80:
                 position = reader.pos
@@ -761,15 +783,10 @@ class BundleFile:
 
             uncompressed_size = self.header.uncompressed_blocks_info_size
 
-            match self.header.flags & 0x3F:
-                case 1:  # LZMA
-                    raise RuntimeError('LZMA unsupported')
-                case 2 | 3:  # LZ4 | LZ4HC
-                    uncompressed_data = lz4_decompress(block_info_bytes, uncompressed_size=uncompressed_size)
-                    if len(uncompressed_data) != uncompressed_size:
-                        raise RuntimeError('lz4 decompression error: size not correct')
-                case _:
-                    uncompressed_data = bytes(block_info_bytes)
+            uncompressed_data = self._decompress_data(block_info_bytes, uncompressed_size, self.header.flags)
+
+            if self._is_new_format and self._check_flag(0x200):
+                reader.align(16)
 
             with BinaryReader(uncompressed_data) as uc_reader:
                 _uncompressed_data_hash = uc_reader.read(16)
@@ -793,13 +810,13 @@ class BundleFile:
             block_stream = bytearray()
 
             for block in self.blocks_info:
-                match block.flags & 0x3F:
-                    case 1:  # LZMA
-                        raise RuntimeError('LZMA unsupported')
-                    case 2 | 3:  # LZ4 | LZ4HC
-                        block_stream.extend(lz4_decompress(reader.read(block.compressed_size), uncompressed_size=block.uncompressed_size))
-                    case _:  # raw
-                        block_stream.extend(reader.read(block.compressed_size))
+                block_stream.extend(
+                    self._decompress_data(
+                        reader.read(block.compressed_size),
+                        block.uncompressed_size,
+                        block.flags,
+                    )
+                )
 
             with BinaryReader(block_stream) as s_reader:
                 self.files = []
@@ -809,6 +826,99 @@ class BundleFile:
                     s_reader.pos = node.offset
                     file.stream = s_reader.read(node.size)
                     self.files.append(file)
+
+
+    @staticmethod
+    def _parse_version(unity_version: str) -> tuple[int, int, int]:
+        m = re.match(r"(\d+)\.(\d+)\.(\d+)", unity_version)
+        if m:
+            return tuple(int(x) for x in m.groups())
+        return (0, 0, 0)
+
+    def _check_flag(self, flag: int) -> bool:
+        return bool(self.data_flags & flag)
+
+    def _handle_encryption(self, reader: 'BinaryReader'):
+        is_old_flag = self.unity_version_tuple < (2020,) or (
+            self.unity_version_tuple[0] == 2020 and self.unity_version_tuple < (2020, 3, 34)
+        ) or (
+            self.unity_version_tuple[0] == 2021 and self.unity_version_tuple < (2021, 3, 2)
+        ) or (
+            self.unity_version_tuple[0] == 2022 and self.unity_version_tuple < (2022, 1, 1)
+        )
+
+        self._is_new_format = not is_old_flag
+        if is_old_flag:
+            encryption_flag = 0x200
+        else:
+            encryption_flag = 0x400
+
+        if self.header.flags & encryption_flag:
+            self.decryptor = ArchiveStorageDecryptor(reader)
+
+    def _decompress_data(self, data: bytes, uncompressed_size: int, flags: int) -> bytes:
+        if self.decryptor is not None and flags & 0x100:
+            data = self.decryptor.decrypt_block(data)
+        match flags & 0x3F:
+            case 1:
+                return _decompress_lzma(data)
+            case 2 | 3:
+                result = lz4_decompress(data, uncompressed_size=uncompressed_size)
+                if len(result) != uncompressed_size:
+                    raise RuntimeError("lz4 decompression error: size not correct")
+                return result
+            case _:
+                return bytes(data)
+
+
+def _decompress_lzma(data: bytes) -> bytes:
+    import lzma as _lzma
+    from struct import unpack as _unpack
+    props = data[0]
+    dict_size = _unpack("<I", data[1:5])[0]
+    lc = props % 9
+    remainder = props // 9
+    pb = remainder // 5
+    lp = remainder % 5
+    dec = _lzma.LZMADecompressor(
+        format=_lzma.FORMAT_RAW,
+        filters=[
+            {
+                "id": _lzma.FILTER_LZMA1,
+                "dict_size": dict_size,
+                "lc": lc,
+                "lp": lp,
+                "pb": pb,
+            }
+        ],
+    )
+    return dec.decompress(data[5:])
+
+
+class ArchiveStorageDecryptor:
+    unknown_1: int
+    data: bytes
+    key: bytes
+    data_sig: bytes
+    key_sig: bytes
+
+    def __init__(self, reader: 'BinaryReader') -> None:
+        self.unknown_1 = reader.u32
+        self.data, self.key = self._read_vector(reader)
+        self.data_sig, self.key_sig = self._read_vector(reader)
+
+    @staticmethod
+    def _read_vector(reader: 'BinaryReader') -> tuple[bytes, bytes]:
+        data = reader.read(0x10)
+        key = reader.read(0x10)
+        reader.skip(1)
+        return data, key
+
+    def decrypt_block(self, data: bytes, index: int = 0) -> bytes:
+        raise RuntimeError(
+            "AssetBundle encryption not supported without a decryption key."
+        )
+
 
 
 class AssetsManager:
@@ -823,23 +933,38 @@ class AssetsManager:
         self.resource_file_readers = {}
         self.asset_file_index_cache = {}
 
-    def load_file(self, file: IO[bytes] | FileReader):
+    def load_file(self, file: IO[bytes] | FileReader, original_path: pathlib.Path | None = None):
         if not isinstance(file, FileReader):
-            file = FileReader(file, file.name)
-        if file.file_type == FileReader.FileType.BundleFile:
+            fname = str(original_path or file.name)
+            file = FileReader(file, fname)
+
+        ft = file.file_type
+        if ft == FileReader.FileType.BundleFile:
             self.load_bundle(file)
+        elif ft == FileReader.FileType.AssetsFile:
+            self.load_assets_direct(file, original_path)
 
     def load_bundle(self, reader: FileReader, original_path: pathlib.Path | None = None):
         bundle_file = BundleFile(reader)
         for file in bundle_file.files:
             subreader = FileReader(file.stream, reader.path.parent / pathlib.Path(file.path).name)
             subreader.pos = 0
-            if subreader.file_type == FileReader.FileType.AssetsFile:
+            ft = subreader.file_type
+            if ft == FileReader.FileType.AssetsFile:
                 self.load_assets(
                     subreader, original_path or reader.path, bundle_file.header.unity_revision, bundle_file
                 )
+            elif ft == FileReader.FileType.BundleFile:
+                self.load_bundle(subreader, original_path)
             else:
                 self.resource_file_readers[os.path.basename(file.path)] = subreader
+
+    def load_assets_direct(self, reader: FileReader, original_path: pathlib.Path | None = None):
+        if reader.path.name not in self.asset_file_hashes:
+            asset_file = SerializedFile(reader, self, None)
+            asset_file.original_path = original_path or reader.path
+            self.asset_files.append(asset_file)
+            self.asset_file_hashes.append(asset_file.path.name)
 
     def load_assets(self, reader: FileReader, original_path: pathlib.Path, unity_version: str, bundle_file: BundleFile):
         if reader.path.name not in self.asset_file_hashes:

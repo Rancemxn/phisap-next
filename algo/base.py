@@ -223,6 +223,11 @@ class AlgorithmConfigure(TypedDict):
     algo2_target_score: int
     algo2_strict_mode: bool
     algo2_continue_when_failed: bool
+    algo4_flick_start: int
+    algo4_flick_end: int
+    algo4_flick_direction: int
+    algo4_sample_delay: int
+    algo4_continue_when_failed: bool
 
 
 __all__ = ['TouchAction', 'VirtualTouchEvent', 'TouchEvent', 'distance_of', 'ScreenUtil']
