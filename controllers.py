@@ -148,7 +148,7 @@ class ScrcpyController:
 
     def reset_touches(self) -> None:
         """Send UP events for all possible finger IDs to release dangling touches."""
-        for pointer_id in range(10):
+        for pointer_id in range(1000,1010):
             self.touch(0, 0, TouchAction.UP, pointer_id)
 
     def clean(self) -> None:

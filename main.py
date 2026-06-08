@@ -710,11 +710,31 @@ class MainWindow(QWidget):
 
     def onSongIdChanged(self, _: str) -> None:
         # update difficultySelector
+        prev_diff = self.difficultySelector.currentText()
         songIdDir = Path(self.extractedCharts / self.songIdSelector.currentData())
         self.difficultySelector.clear()
+        
+        available_diffs = {}
         for file in songIdDir.glob('Chart_*.json'):
             name = file.name
-            self.difficultySelector.addItem(name[6:-5], file.name)
+            diff_name = name[6:-5]
+            available_diffs[diff_name] = name
+            self.difficultySelector.addItem(diff_name, name)
+        
+        target_diff = None
+        if prev_diff in available_diffs:
+            target_diff = prev_diff
+        else:
+            fallbacks = ['AT', 'IN', 'HD', 'EZ']
+            for fb in fallbacks:
+                if fb in available_diffs:
+                    target_diff = fb
+                    break
+            if target_diff is None and available_diffs:
+                target_diff = list(available_diffs.keys())[0]
+                
+        if target_diff:
+            self.difficultySelector.setCurrentText(target_diff)
         if not self.difficultySelector.isEnabled():
             self.difficultySelector.setDisabled(False)
 
@@ -933,12 +953,18 @@ class MainWindow(QWidget):
         self.autoplayWorker.finished.connect(self.cleanAfterAutoplay)
 
         self.goButton.clicked.disconnect()
-        self.goButton.clicked.connect(self.autoplayWorker.stop)
+        self.goButton.clicked.connect(self.cleanInterrtupt)
         self.goButton.setText(self.tr('Stop'))
 
         self.delayInput.setValue(0)
         self.delayInput.setDisabled(False)
         self.delayInput.valueChanged.connect(self.autoplayWorker.onDelayChanged)
+    
+    def cleanInterrtupt(self) -> None:
+        self.autoplayWorker.stop()
+        if self.controller:
+            self.controller.reset_touches()
+        self.autoplayWorker = None
 
     def cleanAfterAutoplay(self) -> None:
         # Release any dangling pointers left in DOWN state from mid-stop
