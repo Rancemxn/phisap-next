@@ -370,7 +370,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     dense_frame_sizes[base_ms] += 1
                     p_touch = adj_pos
                     for off in range(1, hold_ms, sample_delay):
-                        t = (base_ms + off) / 1000
+                        t = ((base_ms + off) // sample_delay) * sample_delay
+                        t = max(base_ms, min(t, base_ms + hold_ms))
                         ang = line.angle @ t
                         rot = cmath.exp(ang * 1j)
                         pos = line.pos(t, adj_offset)
