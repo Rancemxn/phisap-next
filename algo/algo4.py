@@ -1,7 +1,7 @@
 ﻿import math
 import cmath
 import itertools
-from typing import NamedTuple, TypeAlias, Iterable
+from typing import NamedTuple, TypeAlias, Iterable, Any
 from collections import defaultdict
 from enum import Enum
 
@@ -66,6 +66,9 @@ class PointerRecord(NamedTuple):
     id: PointerID
     position: Position
     timestamp: int
+    line_ref: Any = None
+    note_offset: float = 0.0
+    note_type: SemiNoteType = None
 
 class JudgeArea:
     __slots__ = ('center', 'rotation', 'poly')
@@ -110,11 +113,13 @@ class PointerManager:
         self.waiting_liftup: list[tuple[PointerRecord, int]] = []
         self.current_ts: int = 0
 
-    def alloc(self, note: SemiNote, new: bool = True) -> tuple[PointerID, bool]:
+    def alloc(self, note: SemiNote, new: bool = True, line_ref: any = None, note_offset: float = 0.0) -> tuple[PointerID, bool]:
         nid = note.id
         if nid in self.occupied:
             ptr = self.occupied[nid]
-            self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts)
+            cur_line = line_ref if line_ref is not None else ptr.line_ref
+            cur_offset = note_offset if line_ref is not None else ptr.note_offset
+            self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, cur_line, cur_offset, note.type)
             self.last_active_ts[ptr.id] = self.current_ts
             return ptr.id, False
         if not new and self.unused:
@@ -125,12 +130,12 @@ class PointerManager:
             if valid_unused:
                 ptr = min(valid_unused.values(), key=lambda p: abs(note.position - p.position))
                 del self.unused[ptr.id]
-                self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts)
+                self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
                 self.last_active_ts[ptr.id] = self.current_ts
                 return ptr.id, False
         if self.idle:
             pid = self.idle.pop()
-            self.occupied[nid] = PointerRecord(pid, note.position, self.current_ts)
+            self.occupied[nid] = PointerRecord(pid, note.position, self.current_ts, line_ref, note_offset, note.type)
             self.last_active_ts[pid] = self.current_ts
             return pid, True
         if self.unused:
@@ -143,23 +148,34 @@ class PointerManager:
                 up_ts = self.current_ts - 1
             up_ts = max(0, up_ts)
             self.waiting_liftup.append((ptr, up_ts))
-            self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts)
+            self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
             self.last_active_ts[ptr.id] = self.current_ts
             return ptr.id, True
         
+        # ==================== 新增 DEBUG 代码 ====================
         print(f"\n[CRASH DEBUG] 触控点耗尽。崩溃时间戳: {self.current_ts} ms")
         print("当前【占用中】的指针状态 (NoteID -> PointerID):")
         for nid, record in self.occupied.items():
             print(f"  - 音符ID {nid} 占用了手指 {record.id} (分配于 {record.timestamp} ms, 坐标: {record.position})")
         print(f"当前【闲置】的指针 (idle): {self.idle}")
         print(f"当前【未释放】的缓存指针 (unused): {self.unused}")
+        # ========================================================
         
         raise RuntimeError(f'no free pointers @ {self.current_ts}')
 
     def free(self, note: SemiNote) -> None:
         if note.id in self.occupied:
             ptr = self.occupied.pop(note.id)
-            self.unused[ptr.id] = PointerRecord(ptr.id, ptr.position, self.current_ts)
+            is_still_shared = any(active_ptr.id == ptr.id for active_ptr in self.occupied.values())
+            if not is_still_shared:
+                self.unused[ptr.id] = PointerRecord(
+                    id=ptr.id, 
+                    position=ptr.position, 
+                    timestamp=self.current_ts,
+                    line_ref=ptr.line_ref,
+                    note_offset=ptr.note_offset,
+                    note_type=note.type
+                )
 
     def recycle(self) -> Iterable[tuple[PointerRecord, int]]:
         for ptr, up_ts in self.waiting_liftup:
@@ -195,6 +211,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     max_concurrent_holds = 0
     max_frame_must = 0
     max_frame_may = 0
+    note_id_to_line: dict[NoteID, any] = {}
+    note_id_to_offset: dict[NoteID, float] = {}
 
     def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj):
         area_obj = JudgeArea(base_pos, base_rot, screen.width, screen.height)
@@ -245,7 +263,30 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
 
     def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, start_off: int) -> Position:
         rate = 1 - 2 * (offset_ms - start_off) / flick_duration
-        return pos + rot * f_dir * screen.flick_radius * rate
+        p1 = pos + rot * f_dir * screen.flick_radius
+        p2 = pos - rot * f_dir * screen.flick_radius
+        margin_x = screen.width * 0.05
+        margin_y = screen.height * 0.05
+        limit_min_x = margin_x
+        limit_max_x = screen.width - margin_x
+        limit_min_y = margin_y
+        limit_max_y = screen.height - margin_y
+        shift_x = 0.0
+        shift_y = 0.0
+        max_x = max(p1.real, p2.real)
+        min_x = min(p1.real, p2.real)
+        if max_x > limit_max_x:
+            shift_x -= (max_x - limit_max_x)
+        if min_x < limit_min_x:
+            shift_x += (limit_min_x - min_x)
+        max_y = max(p1.imag, p2.imag)
+        min_y = min(p1.imag, p2.imag)
+        if max_y > limit_max_y:
+            shift_y -= (max_y - limit_max_y)
+        if min_y < limit_min_y:
+            shift_y += (limit_min_y - min_y)
+        shifted_center = pos + (shift_x + shift_y * 1j)
+        return shifted_center + rot * f_dir * screen.flick_radius * rate
 
     frames: defaultdict[int, list[SemiNote]] = defaultdict(list)
     dense_frame_sizes: defaultdict[int, int] = defaultdict(int)
@@ -260,6 +301,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             adj_time, adj_pos, adj_rot, adj_offset, adjusted = find_visible_pos(
                 note.seconds, note_pos, rotation, note.offset, line
             )
+            if note.type == NoteType.HOLD:
+                note_id_to_line[current_note_id] = line
+                note_id_to_offset[current_note_id] = adj_offset
             match note.type:
                 case NoteType.TAP:
                     ts = round(adj_time * 1000)
@@ -280,6 +324,16 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     best_dir = flick_dir
                     if not check_path_validity(flick_dir) and check_path_validity(-flick_dir):
                         best_dir = -flick_dir
+                    t_start = note.seconds
+                    t_end = note.seconds + flick_duration / 1000.0
+                    pos_start = line.position @ t_start
+                    pos_end = line.position @ t_end
+                    line_vel = pos_end - pos_start
+                    if abs(line_vel) > 1e-5:
+                        dot_forward = ((adj_rot * best_dir) * line_vel.conjugate()).real
+                        dot_backward = ((adj_rot * -best_dir) * line_vel.conjugate()).real
+                        if dot_backward > dot_forward:
+                            best_dir = -best_dir
                     curr_flick_start = flick_start
                     curr_flick_end = flick_end
                     half_w = screen.width / 18
@@ -380,19 +434,25 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         may_notes: list[SemiNote] = []
         active_never: list[SemiNote] = []
         passive_notes: list[SemiNote] = []
+        active_physical_touches: dict[PointerID, Position] = {}
         confirmed_pointers: dict[PointerID, Position] = {}
         
         pointers.current_ts = timestamp
         
         # ==================== 新增 DEBUG 代码 ====================
         # 当已占用的手指数量接近上限时，输出警告和当前帧音符详情
-        if len(pointers.occupied) >= pointers_count - 2:
+        if len(pointers.occupied) >= pointers_count:
             console.print(f"[bold red]⚠️ 触控点即将耗尽！时间戳: {timestamp} ms (已占用: {len(pointers.occupied)}/{pointers_count})[/bold red]")
             console.print("当前帧待处理的音符:")
             for note in frame:
                 console.print(f"  - NoteID: {note.id}, 类型: {note.type}, 坐标: {note.position}")
         # ========================================================
         
+        t_sec = timestamp / 1000.0
+        for nid, record in list(pointers.occupied.items()):
+            active_physical_touches[record.id] = record.position
+        
+        current_touches = active_physical_touches.copy()
         for note in frame:
             if note.type in (SemiNoteType.TAP, SemiNoteType.HOLD_START):
                 must_notes.append(note)
@@ -446,56 +506,119 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 break
         
         for note, target in zip(must_notes, must_targets):
-            pid, is_down = pointers.alloc(SemiNote(note.type, target, note.id, note.rotation))
+            line_ref = note_id_to_line.get(note.id)
+            offset_val = note_id_to_offset.get(note.id, 0.0)
+            pid, is_down = pointers.alloc(
+                SemiNote(note.type, target, note.id, note.rotation),
+                line_ref=line_ref,
+                note_offset=offset_val
+            )
             act = TouchAction.DOWN if is_down else TouchAction.MOVE
             result[timestamp].append(VirtualTouchEvent(target, act, pid))
             if note.type == SemiNoteType.TAP:
                 to_free.append(note)
             confirmed_pointers[pid] = target
+        current_touches.update(confirmed_pointers)
+        flicking_pids = {
+            r.id for r in pointers.occupied.values()
+            if r.note_type in (SemiNoteType.FLICK_START, SemiNoteType.FLICK, SemiNoteType.FLICK_END)
+        }
         for note in may_notes:
-            pid, is_down = pointers.alloc(note, new=False)
-            act = TouchAction.DOWN if is_down else TouchAction.MOVE
-            result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
-            confirmed_pointers[pid] = note.position
+            line_ref = note_id_to_line.get(note.id)
+            offset_val = note_id_to_offset.get(note.id, 0.0)
+            poly_n = JudgeArea(note.position, note.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
+            covering_pid = None
+            covering_pos = None
+            for pid, p_touch in current_touches.items():
+                if pid in flicking_pids:
+                    continue
+                if poly_n.intersects(Point(p_touch.real, p_touch.imag)):  
+                    covering_pid = pid
+                    covering_pos = p_touch
+                    break
+            if covering_pid is not None:
+                pointers.occupied[note.id] = PointerRecord(covering_pid, note.position, timestamp, line_ref, offset_val, note.type)
+                result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, covering_pid))
+                confirmed_pointers[covering_pid] = note.position
+                current_touches[covering_pid] = note.position
+                flicking_pids.add(covering_pid)
+            else:
+                pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
+                act = TouchAction.DOWN if is_down else TouchAction.MOVE
+                result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
+                confirmed_pointers[pid] = note.position
+                current_touches[pid] = note.position
         for note in active_never:
+            line_ref = note_id_to_line.get(note.id)
+            offset_val = note_id_to_offset.get(note.id, 0.0)
             if note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END):
-                pid, _ = pointers.alloc(note)
+                pid, _ = pointers.alloc(note, line_ref=line_ref, note_offset=offset_val)
                 result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
                 if note.type == SemiNoteType.FLICK_END:
                     to_free.append(note)
                 confirmed_pointers[pid] = note.position
             elif note.type == SemiNoteType.HOLD_END:
                 if note.id in pointers.occupied:
-                    pid, _ = pointers.alloc(note)
+                    pid, _ = pointers.alloc(note, line_ref=line_ref, note_offset=offset_val)
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
                     to_free.append(note)
                     confirmed_pointers[pid] = note.position
         active_touches = [ptr.position for ptr in pointers.occupied.values()]
+        current_touches = active_physical_touches.copy()
+        current_touches.update(confirmed_pointers)
         for note in passive_notes:
             poly_n = JudgeArea(note.position, note.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
+            self_record = pointers.occupied.get(note.id)
+            self_pid = self_record.id if self_record is not None else None
+            is_self_covered = False
+            if self_pid is not None and self_pid in current_touches:
+                actual_pos = current_touches[self_pid]
+                if poly_n.intersects(Point(actual_pos.real, actual_pos.imag)):
+                    is_self_covered = True
+                    self_record = self_record._replace(position=actual_pos)
             is_covered = False
-            for p_touch in confirmed_pointers.values():
-                if poly_n.contains(Point(p_touch.real, p_touch.imag)):
+            covering_pid = None
+            covering_pos = None
+            for pid, p_touch in current_touches.items():
+                if pid == self_pid:
+                    continue
+                if poly_n.intersects(Point(p_touch.real, p_touch.imag)):
                     is_covered = True
+                    covering_pid = pid
+                    covering_pos = p_touch
                     break
+            line_ref = note_id_to_line.get(note.id)
+            offset_val = note_id_to_offset.get(note.id, 0.0)
+            
             if is_covered:
                 if note.type == SemiNoteType.DRAG:
                     continue
                 elif note.type == SemiNoteType.HOLD:
-                    if note.id in pointers.occupied:
-                        to_free.append(note)
+                    if covering_pid is not None:
+                        if note.id in pointers.occupied:
+                            pointers.free(note)
+                        pointers.occupied[note.id] = PointerRecord(covering_pid, covering_pos, timestamp, line_ref, offset_val, note.type)
+            elif note.type == SemiNoteType.HOLD and is_self_covered:
+                pointers.occupied[note.id] = PointerRecord(self_pid, self_record.position, timestamp, line_ref, offset_val, note.type)
+                pointers.last_active_ts[self_pid] = timestamp
+                confirmed_pointers[self_pid] = self_record.position
+                current_touches[self_pid] = self_record.position
             else:
                 if note.type == SemiNoteType.DRAG:
-                    pid, is_down = pointers.alloc(note, new=False)
+                    pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
                     act = TouchAction.DOWN if is_down else TouchAction.MOVE
                     result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                     to_free.append(note)
                     confirmed_pointers[pid] = note.position
+                    current_touches[pid] = note.position 
                 elif note.type == SemiNoteType.HOLD:
-                    pid, is_down = pointers.alloc(note, new=False)
+                    if note.id in pointers.occupied:
+                        pointers.free(note)
+                    pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
                     act = TouchAction.DOWN if is_down else TouchAction.MOVE
                     result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                     confirmed_pointers[pid] = note.position
+                    current_touches[pid] = note.position
         
         for note_to_free in to_free:
             pointers.free(note_to_free)

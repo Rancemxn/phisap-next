@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, json, math, cmath, time
+import sys, json, math, time
 from basis import Vector, Position, NoteType
 from bamboo import BrokenBamboo
 from rich.console import Console
@@ -15,12 +15,13 @@ from PySide6.QtCore import QTimer, Qt
 WW, WH = 1280, 720
 PR = 16
 
+# 改为 RGB 元组定义，以便在运行时结合不透明度（alpha）动态生成 skia.Color
 NC = {
-    NoteType.TAP: skia.Color(10, 195, 255),
-    NoteType.DRAG: skia.Color(240, 237, 105),
-    NoteType.HOLD: skia.Color(0, 255, 255),
-    NoteType.FLICK: skia.Color(254, 67, 101),
-    NoteType.UNKNOWN: skia.Color(100, 100, 100)
+    NoteType.TAP: (10, 195, 255),
+    NoteType.DRAG: (240, 237, 105),
+    NoteType.HOLD: (0, 255, 255),
+    NoteType.FLICK: (254, 67, 101),
+    NoteType.UNKNOWN: (100, 100, 100)
 }
 
 def rotate_point(x: float, y: float, r: float, deg: float) -> tuple[float, float]:
@@ -45,14 +46,14 @@ def find_event(t: float, es: list[dict]) -> int:
             l = m + 1
     return -1
 
-def get_event_val(t: float, es: list[dict], sn: str, en: str) -> float:
+def get_event_val(t: float, es: list[dict], sn: str, en: str, default: float = 0.0) -> float:
     i = find_event(t, es)
     if i == -1:
         if es and t > es[-1]["endTime"]:
             return es[-1][en]
         if es and t < es[0]["startTime"]:
             return es[0][sn]
-        return 0.0
+        return default
     e = es[i]
     st, et = e["startTime"], e["endTime"]
     sv, ev = e[sn], e[en]
@@ -70,41 +71,56 @@ def get_fp(t: float, es: list[dict]) -> float:
     e = es[i]
     return e["floorPosition"] + (t - e["startTime"]) * e["value"]
 
-def get_line_state(line_data: dict, t: float, fv: int) -> tuple[float, float, float, float]:
-    bl = 1.875 / line_data["bpm"]
-    beatt = t / bl
+def get_line_state(line: VPJL, t: float, fv: int) -> tuple[float, float, float, float]:
+    rotate = get_event_val(t, line.rotate_events, "start", "end", 0.0) * -1
     
-    rotate = get_event_val(beatt, line_data.get("judgeLineRotateEvents", []), "start", "end") * -1
+    move_events = line.move_events
+    x, y = 0.5, 0.5
     
-    move_events = line_data.get("judgeLineMoveEvents", [])
-    i = find_event(beatt, move_events)
-    if i == -1:
-        x, y = 0.5, 0.5
-    else:
-        e = move_events[i]
-        st, et = e["startTime"], e["endTime"]
-        if fv == 1:
-            sv, ev = e["start"], e["end"]
-            sx, sy = (sv // 1000) / 880.0, (sv % 1000) / 520.0
-            ex, ey = (ev // 1000) / 880.0, (ev % 1000) / 520.0
-            if et == st:
-                x, y = sx, sy
-            else:
-                ratio = (beatt - st) / (et - st)
-                x = sx + ratio * (ex - sx)
-                y = sy + ratio * (ey - sy)
-            y = 1.0 - y
+    if move_events:
+        i = find_event(t, move_events)
+        if i == -1:
+            if t > move_events[-1]["endTime"]:
+                e = move_events[-1]
+                if fv == 1:
+                    ev = e["end"]
+                    x, y = (ev // 1000) / 880.0, 1.0 - (ev % 1000) / 520.0
+                else:
+                    x = e["end"]
+                    y = 1.0 - e.get("end2", 0.0)
+            elif t < move_events[0]["startTime"]:
+                e = move_events[0]
+                if fv == 1:
+                    sv = e["start"]
+                    x, y = (sv // 1000) / 880.0, 1.0 - (sv % 1000) / 520.0
+                else:
+                    x = e["start"]
+                    y = 1.0 - e.get("start2", 0.0)
         else:
-            s2, e2 = e.get("start2", 0.0), e.get("end2", 0.0)
-            if et == st:
-                x = e["start"]
-                y = 1.0 - s2
+            e = move_events[i]
+            st, et = e["startTime"], e["endTime"]
+            if fv == 1:
+                sv, ev = e["start"], e["end"]
+                sx, sy = (sv // 1000) / 880.0, (sv % 1000) / 520.0
+                ex, ey = (ev // 1000) / 880.0, (ev % 1000) / 520.0
+                if et == st:
+                    x, y = sx, sy
+                else:
+                    ratio = (t - st) / (et - st)
+                    x = sx + ratio * (ex - sx)
+                    y = sy + ratio * (ey - sy)
+                y = 1.0 - y
             else:
-                ratio = (beatt - st) / (et - st)
-                x = e["start"] + ratio * (e["end"] - e["start"])
-                y = 1.0 - (s2 + ratio * (e2 - s2))
-                
-    alpha = get_event_val(beatt, line_data.get("judgeLineDisappearEvents", []), "start", "end")
+                s2, e2 = e.get("start2", 0.0), e.get("end2", 0.0)
+                if et == st:
+                    x = e["start"]
+                    y = 1.0 - s2
+                else:
+                    ratio = (t - st) / (et - st)
+                    x = e["start"] + ratio * (e["end"] - e["start"])
+                    y = 1.0 - (s2 + ratio * (e2 - s2))
+                    
+    alpha = get_event_val(t, line.disappear_events, "start", "end", 1.0)
     return rotate, x, y, alpha
 
 class VN:
@@ -128,33 +144,77 @@ class VPJL:
         s.bpm = d["bpm"]
         s.raw_data = d
         bl = 1.875 / s.bpm
-        s.notes = []
         
-        fp = 0.0
+        s.speed_events = []
         for e in d.get("speedEvents", []):
+            s.speed_events.append({
+                "startTime": e["startTime"] * bl,
+                "endTime": e["endTime"] * bl,
+                "value": e["value"],
+                "floorPosition": 0.0
+            })
+        s.speed_events.sort(key=lambda x: x["startTime"])
+        
+        s.rotate_events = []
+        for e in d.get("judgeLineRotateEvents", []):
+            s.rotate_events.append({
+                "startTime": e["startTime"] * bl,
+                "endTime": e["endTime"] * bl,
+                "start": e["start"],
+                "end": e["end"]
+            })
+        s.rotate_events.sort(key=lambda x: x["startTime"])
+        
+        s.move_events = []
+        for e in d.get("judgeLineMoveEvents", []):
+            s.move_events.append({
+                "startTime": e["startTime"] * bl,
+                "endTime": e["endTime"] * bl,
+                "start": e["start"],
+                "end": e["end"],
+                "start2": e.get("start2", 0.0),
+                "end2": e.get("end2", 0.0)
+            })
+        s.move_events.sort(key=lambda x: x["startTime"])
+        
+        s.disappear_events = []
+        for e in d.get("judgeLineDisappearEvents", []):
+            s.disappear_events.append({
+                "startTime": e["startTime"] * bl,
+                "endTime": e["endTime"] * bl,
+                "start": e["start"],
+                "end": e["end"]
+            })
+        s.disappear_events.sort(key=lambda x: x["startTime"])
+
+        fp = 0.0
+        for e in s.speed_events:
             e["floorPosition"] = fp
             fp += (e["endTime"] - e["startTime"]) * e["value"]
             
-        for src in (d.get("notesAbove", []), d.get("notesBelow", [])):
-            ab = (src is d.get("notesAbove", []))
+        s.notes = []
+        for is_above, src_key in [(True, "notesAbove"), (False, "notesBelow")]:
+            src = d.get(src_key, [])
             for n in src:
                 ni = VPJL._NNI
                 VPJL._NNI += 1
                 note_beat_time = n["time"]
-                note_floor = get_fp(note_beat_time, d.get("speedEvents", []))
+                note_time_sec = note_beat_time * bl
                 
-                hold_beat = n["holdTime"]
+                note_floor = get_fp(note_time_sec, s.speed_events)
+                
+                hold_beat = n.get("holdTime", 0.0)
                 hold_sec = hold_beat * bl
-                hold_length = hold_sec * n["speed"] * 0.6
+                hold_length = hold_sec * n.get("speed", 1.0)
                 
                 s.notes.append(VN(
                     t=s._NT[n["type"]],
-                    time=note_beat_time * bl,
+                    time=note_time_sec,
                     offset=n["positionX"],
                     hold=hold_sec,
-                    speed=n["speed"],
+                    speed=n.get("speed", 1.0),
                     floor=note_floor,
-                    above=ab,
+                    above=is_above,
                     nid=ni,
                     hold_length=hold_length
                 ))
@@ -248,12 +308,13 @@ class CW(QWidget):
             s.ct = max(0.0, s.ct)
             now = s.ct
             
+        chart_now = now - s.vc.offset
+            
         c = s.surf.getCanvas()
         c.clear(skia.ColorBLACK)
         
         for line in s.vc.lines:
-            line_data = line.raw_data
-            lineRotate, lineX_norm, lineY_norm, lineAlpha = get_line_state(line_data, now, s.vc.fv)
+            lineRotate, lineX_norm, lineY_norm, lineAlpha = get_line_state(line, chart_now, s.vc.fv)
             
             lineX = lineX_norm * WW
             lineY = lineY_norm * WH
@@ -270,20 +331,20 @@ class CW(QWidget):
             lp.setAntiAlias(True)
             c.drawLine(lx0, ly0, lx1, ly1, lp)
             
-            bl = 1.875 / line_data["bpm"]
-            beatt = now / bl
-            linefp = get_fp(beatt, line_data.get("speedEvents", []))
+            linefp = get_fp(chart_now, line.speed_events)
             
             for n in line.notes:
                 is_hold = (n.t == NoteType.HOLD)
-                if (not is_hold and n.time < now) or (is_hold and (n.time + n.hold) < now):
+                if (not is_hold and n.time < chart_now) or (is_hold and (n.time + n.hold) < chart_now):
                     continue
-                    
-                note_fp = (n.floor - linefp) * 0.6 * bl * WH
+                
+                note_fp_y = n.floor - linefp
                 if not is_hold:
-                    note_fp *= n.speed
-                    
-                if not is_hold and note_fp < -1000000.0:
+                    note_fp_y *= n.speed
+                
+                note_fp = note_fp_y * 0.6 * WH
+                
+                if not is_hold and note_fp < -10000.0:
                     continue
                 if note_fp > WH * 2:
                     continue
@@ -297,53 +358,49 @@ class CW(QWidget):
                 hx, hy = rotate_point(at_x, at_y, note_fp, l2n_rotate)
                 note_draw_rotate = lineRotate + (0 if n.above else 180)
                 
-                base_op = lineAlpha
-                if now > n.time and not is_hold:
-                    base_op *= max(0.0, 1.0 - (now - n.time) / 0.16)
+                base_op = 1.0
+                if chart_now > n.time and not is_hold:
+                    base_op *= max(0.0, 1.0 - (chart_now - n.time) / 0.16)
                     
-                col = NC.get(n.t, skia.Color(100, 100, 100))
+                # 从 NC 配置中读取对应的 RGB 值
+                r, g, b = NC.get(n.t, (100, 100, 100))
                 
                 paint_fill = skia.Paint()
-                paint_fill.setColor(col)
-                paint_fill.setAlphaf(base_op)
+                # 动态合并色值和计算得到的 alpha 混合度，创建新 skia.Color
+                paint_fill.setColor(skia.Color(r, g, b, int(base_op * 255)))
                 paint_fill.setStyle(skia.Paint.kFill_Style)
                 paint_fill.setAntiAlias(True)
                 
-                draw_head = (n.time > now)
+                draw_head = (n.time > chart_now)
                 if draw_head:
                     rx, ry = this_note_head_height * 0.25, this_note_head_height * 0.25
                     draw_center_rotate_round_rect(c, hx, hy, this_note_width, this_note_head_height, rx, ry, note_draw_rotate, paint_fill)
                     
                 if is_hold:
                     note_tail_height = this_note_width * 0.14
-                    clicked = (now >= n.time)
+                    clicked = (chart_now >= n.time)
                     
-                    min_fp = min(0.0, note_fp)
-                    head_offset = (this_note_head_height / 2.0) if clicked else 0.0
-                    note_body_height = max(
-                        n.hold_length * WH
-                        + min_fp
-                        + head_offset
-                        - note_tail_height / 2.0,
-                        0.0
-                    )
-                    
-                    if note_body_height > 0.0:
-                        base_x, base_y = (hx, hy) if not clicked else (at_x, at_y)
-                        offset_dist = (this_note_head_height / 2.0 if not clicked else 0.0) + note_body_height / 2.0
-                        bx, by = rotate_point(base_x, base_y, offset_dist, l2n_rotate)
+                    if not clicked:
+                        note_body_height = max(0.0, n.hold_length * 0.6 * WH - note_tail_height / 2.0)
+                        body_center_offset = this_note_head_height / 2.0 + note_body_height / 2.0
+                        bx, by = rotate_point(hx, hy, body_center_offset, l2n_rotate)
+                    else:
+                        remaining_sec = (n.time + n.hold) - chart_now
+                        remaining_len_y = max(0.0, remaining_sec * n.speed)
+                        note_body_height = max(0.0, remaining_len_y * 0.6 * WH - note_tail_height / 2.0)
+                        body_center_offset = note_body_height / 2.0
+                        bx, by = rotate_point(at_x, at_y, body_center_offset, l2n_rotate)
                         
+                    if note_body_height > 0.0:
                         paint_body = skia.Paint()
-                        paint_body.setColor(col)
-                        paint_body.setAlphaf(base_op * 0.4)
+                        paint_body.setColor(skia.Color(r, g, b, int(base_op * 0.4 * 255)))
                         paint_body.setStyle(skia.Paint.kFill_Style)
                         paint_body.setAntiAlias(True)
                         draw_center_rotate_rect(c, bx, by, this_note_width, note_body_height, note_draw_rotate, paint_body)
                         
                         tx, ty = rotate_point(bx, by, note_body_height / 2.0 + note_tail_height / 2.0, l2n_rotate)
                         paint_tail = skia.Paint()
-                        paint_tail.setColor(col)
-                        paint_tail.setAlphaf(base_op)
+                        paint_tail.setColor(skia.Color(r, g, b, int(base_op * 255)))
                         paint_tail.setStyle(skia.Paint.kFill_Style)
                         paint_tail.setAntiAlias(True)
                         rx, ry = note_tail_height * 0.25, note_tail_height * 0.25
@@ -356,16 +413,16 @@ class CW(QWidget):
                 sx = pos.real * s.sc[0]
                 sy = pos.imag * s.sc[1]
                 if -100 <= sx <= WW + 100 and -100 <= sy <= WH + 100:
-                    r = skia.Paint(skia.Color(255, 255, 255))
-                    r.setStyle(skia.Paint.kStroke_Style)
-                    r.setStrokeWidth(3)
-                    r.setAntiAlias(True)
-                    c.drawCircle(sx, sy, PR + 3, r)
+                    r_paint = skia.Paint(skia.Color(255, 255, 255))
+                    r_paint.setStyle(skia.Paint.kStroke_Style)
+                    r_paint.setStrokeWidth(3)
+                    r_paint.setAntiAlias(True)
+                    c.drawCircle(sx, sy, PR + 3, r_paint)
                     
-                    d = skia.Paint(skia.Color(255, 0, 0))
-                    d.setStyle(skia.Paint.kFill_Style)
-                    d.setAntiAlias(True)
-                    c.drawCircle(sx, sy, PR, d)
+                    d_paint = skia.Paint(skia.Color(255, 0, 0))
+                    d_paint.setStyle(skia.Paint.kFill_Style)
+                    d_paint.setAntiAlias(True)
+                    c.drawCircle(sx, sy, PR, d_paint)
                     
                     lp = skia.Paint(skia.Color(255, 255, 255))
                     c.drawString(str(pid), sx + PR + 8, sy + 5, s.fl, lp)
@@ -400,7 +457,7 @@ class CW(QWidget):
         elif k in (Qt.Key_Equal, Qt.Key_Plus):
             s.sp = min(4.0, s.sp + .25)
         elif k == Qt.Key_Minus:
-            s.sp = max(.25, s.sp - .25)
+            s.sp = max(.05, s.sp - .25)
         elif k in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Comma, Qt.Key_Period, Qt.Key_Up, Qt.Key_Down):
             s.kd[k] = True
             if not s.paused: s.paused = True
