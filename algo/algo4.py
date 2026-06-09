@@ -152,15 +152,6 @@ class PointerManager:
             self.last_active_ts[ptr.id] = self.current_ts
             return ptr.id, True
         
-        # ==================== 新增 DEBUG 代码 ====================
-        print(f"\n[CRASH DEBUG] 触控点耗尽。崩溃时间戳: {self.current_ts} ms")
-        print("当前【占用中】的指针状态 (NoteID -> PointerID):")
-        for nid, record in self.occupied.items():
-            print(f"  - 音符ID {nid} 占用了手指 {record.id} (分配于 {record.timestamp} ms, 坐标: {record.position})")
-        print(f"当前【闲置】的指针 (idle): {self.idle}")
-        print(f"当前【未释放】的缓存指针 (unused): {self.unused}")
-        # ========================================================
-        
         raise RuntimeError(f'no free pointers @ {self.current_ts}')
 
     def free(self, note: SemiNote) -> None:
@@ -439,15 +430,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         confirmed_pointers: dict[PointerID, Position] = {}
         
         pointers.current_ts = timestamp
-        
-        # ==================== 新增 DEBUG 代码 ====================
-        # 当已占用的手指数量接近上限时，输出警告和当前帧音符详情
-        if len(pointers.occupied) >= pointers_count:
-            console.print(f"[bold red]⚠️ 触控点即将耗尽！时间戳: {timestamp} ms (已占用: {len(pointers.occupied)}/{pointers_count})[/bold red]")
-            console.print("当前帧待处理的音符:")
-            for note in frame:
-                console.print(f"  - NoteID: {note.id}, 类型: {note.type}, 坐标: {note.position}")
-        # ========================================================
         
         t_sec = timestamp / 1000.0
         for nid, record in list(pointers.occupied.items()):

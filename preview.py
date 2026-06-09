@@ -14,8 +14,6 @@ from PySide6.QtCore import QTimer, Qt
 
 WW, WH = 1280, 720
 PR = 16
-
-# 改为 RGB 元组定义，以便在运行时结合不透明度（alpha）动态生成 skia.Color
 NC = {
     NoteType.TAP: (10, 195, 255),
     NoteType.DRAG: (240, 237, 105),
