@@ -1,3 +1,0 @@
-[submodule "third_party/scrcpy"]
-	path = third_party/scrcpy
-	url = https://github.com/Rancemxn/scrcpy.git
