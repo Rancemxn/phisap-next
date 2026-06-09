@@ -141,7 +141,7 @@ class PointerManager:
         if self.unused:
             ptr = min(self.unused.values(), key=lambda p: abs(note.position - p.position))
             del self.unused[ptr.id]
-            prev_active = self.last_active_ts[ptr.id]
+            prev_active = ptr.timestamp
             if self.current_ts > prev_active + 1:
                 up_ts = (prev_active + self.current_ts) // 2
             else:
@@ -362,7 +362,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     p_touch = adj_pos
                     for off in range(1, hold_ms, sample_delay):
                         t = ((base_ms + off) // sample_delay) * sample_delay
-                        t = max(base_ms, min(t, base_ms + hold_ms))
+                        t = max(base_ms, min(t, base_ms + hold_ms)) / 1000.0
                         ang = line.angle @ t
                         rot = cmath.exp(ang * 1j)
                         pos = line.pos(t, adj_offset)
