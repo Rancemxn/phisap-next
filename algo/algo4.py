@@ -7,6 +7,7 @@ from enum import Enum
 
 from shapely import (
     Polygon,
+    MultiPolygon,
     LineString,
     Point,
     clip_by_rect,
@@ -17,6 +18,7 @@ from shapely import (
     centroid,
 )
 from shapely.ops import nearest_points
+from shapely.affinity import rotate
 
 from basis import Chart, NoteType, Position, Vector
 from .base import RawAnswerType, TouchAction, VirtualTouchEvent, ScreenUtil, AlgorithmConfigure
@@ -68,18 +70,18 @@ class PointerRecord(NamedTuple):
     timestamp: int
     line_ref: Any = None
     note_offset: float = 0.0
-    note_type: SemiNoteType = None
+    note_type: SemiNoteType | None = None
 
 class JudgeArea:
-    __slots__ = ('center', 'rotation', 'poly')
+    __slots__ = ('center', 'rotation', 'poly', 'w_judge')
 
     def __init__(self, center: Position, rotation: Vector, screen_w: float, screen_h: float) -> None:
         self.center = center
         self.rotation = rotation
-        w_judge = screen_w * 0.118125
+        self.w_judge = screen_w * 0.118125
         perp = rotation * 1j
         limit = math.hypot(screen_w, screen_h)
-        d_rot = rotation * (w_judge / 2)
+        d_rot = rotation * (self.w_judge / 2)
         d_perp = perp * limit
         c1 = center + d_rot + d_perp
         c2 = center + d_rot - d_perp
@@ -99,10 +101,25 @@ class JudgeArea:
         valid = inter.difference(pause_poly)
         return valid if not valid.is_empty else Polygon()
 
-    @staticmethod
-    def get_min_area(screen_w: float) -> float:
-        w_judge = screen_w * 0.118125
-        return w_judge * w_judge
+    def is_valid_zone(self, valid_poly: Polygon, screen_w: float) -> bool:
+        if valid_poly.is_empty:
+            return False
+        min_dim = self.w_judge * 0.8
+        if isinstance(valid_poly, MultiPolygon):
+            geoms = list(valid_poly.geoms)
+        else:
+            geoms = [valid_poly]
+        angle_deg = -math.degrees(cmath.phase(self.rotation))
+        for geom in geoms:
+            if geom.is_empty:
+                continue
+            rotated = rotate(geom, angle_deg, origin=(self.center.real, self.center.imag))
+            minx, miny, maxx, maxy = rotated.bounds
+            w = maxx - minx
+            h = maxy - miny
+            if w >= min_dim and h >= min_dim:
+                return True
+        return False
 
 class PointerManager:
     def __init__(self, pointer_ids: Iterable[PointerID]) -> None:
@@ -113,7 +130,7 @@ class PointerManager:
         self.waiting_liftup: list[tuple[PointerRecord, int]] = []
         self.current_ts: int = 0
 
-    def alloc(self, note: SemiNote, new: bool = True, line_ref: any = None, note_offset: float = 0.0) -> tuple[PointerID, bool]:
+    def alloc(self, note: SemiNote, new: bool = True, line_ref: Any = None, note_offset: float = 0.0) -> tuple[PointerID, bool]:
         nid = note.id
         if nid in self.occupied:
             ptr = self.occupied[nid]
@@ -151,7 +168,7 @@ class PointerManager:
             self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
             self.last_active_ts[ptr.id] = self.current_ts
             return ptr.id, True
-        
+
         raise RuntimeError(f'no free pointers @ {self.current_ts}')
 
     def free(self, note: SemiNote) -> None:
@@ -159,6 +176,7 @@ class PointerManager:
             ptr = self.occupied.pop(note.id)
             is_still_shared = any(active_ptr.id == ptr.id for active_ptr in self.occupied.values())
             if not is_still_shared:
+                # 没有note在占用这个指针了，可以丢进unused里去
                 self.unused[ptr.id] = PointerRecord(
                     id=ptr.id, 
                     position=ptr.position, 
@@ -180,35 +198,38 @@ class PointerManager:
             yield ptr, self.current_ts + 10
 
 def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
-    from .base import preprocess as chart_preprocess
-    chart = chart_preprocess(chart, config['algo1_target_score'], config['algo1_strict_mode'])
     screen = ScreenUtil(chart.width, chart.height)
     flick_start = config['algo1_flick_start']
     flick_end = config['algo1_flick_end']
-    flick_duration = flick_end - flick_start
     sample_delay = config['algo1_sample_delay']
-    screen_poly = Polygon([(0, 0), (screen.width, 0), (screen.width, screen.height), (0, screen.height)])
+    flick_duration = flick_end - flick_start
+    padding_x = screen.width * 0.03 
+    padding_y = screen.height * 0.03
+    screen_poly = Polygon([
+        (padding_x, padding_y), 
+        (screen.width - padding_x, padding_y), 
+        (screen.width - padding_x, screen.height - padding_y), 
+        (padding_x, screen.height - padding_y)
+    ])
     pause_poly = Polygon([
         (screen.width * 0.85, 0),
-        (screen.width, 0),
-        (screen.width, screen.height * 0.05),
-        (screen.width * 0.85, screen.height * 0.05)
+        (screen.width * 0.95, 0),
+        (screen.width * 0.95, screen.height * 0.10),
+        (screen.width * 0.85, screen.height * 0.10)
     ])
-    a_min = JudgeArea.get_min_area(screen.width)
-    tap_times_positions: list[tuple[int, Position]] = []
     flick_dir = 1j if config['algo1_flick_direction'] == 0 else 1
     hold_ranges: list[tuple[int, int, int]] = []
     flick_ranges: list[tuple[int, int]] = []
     max_concurrent_holds = 0
     max_frame_must = 0
     max_frame_may = 0
-    note_id_to_line: dict[NoteID, any] = {}
+    note_id_to_line: dict[NoteID, Any] = {}
     note_id_to_offset: dict[NoteID, float] = {}
 
-    def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj):
+    def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj) -> tuple[float, Position, Vector, float, bool]:
         area_obj = JudgeArea(base_pos, base_rot, screen.width, screen.height)
         valid_touch_zone = area_obj.get_valid_poly(screen_poly, pause_poly)
-        if valid_touch_zone.area >= a_min:
+        if area_obj.is_valid_zone(valid_touch_zone, screen.width):
             orig_point = Point(base_pos.real, base_pos.imag)
             closest_geom = nearest_points(valid_touch_zone, orig_point)[0]
             closest_pos = Position(closest_geom.x, closest_geom.y)
@@ -225,11 +246,11 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 new_time = base_sec + (dt * 0.001) * sign
                 new_lp = line_obj.position @ new_time
                 new_alpha = line_obj.angle @ new_time
-                new_rot: Vector = cmath.exp(new_alpha * 1j)
+                new_rot = cmath.exp(new_alpha * 1j)
                 new_note_pos = new_lp + new_rot * note_offset
                 new_area_obj = JudgeArea(new_note_pos, new_rot, screen.width, screen.height)
                 new_valid_zone = new_area_obj.get_valid_poly(screen_poly, pause_poly)
-                if new_valid_zone.area >= a_min:
+                if new_area_obj.is_valid_zone(new_valid_zone, screen.width):
                     orig_point_at_t = Point(new_note_pos.real, new_note_pos.imag)
                     closest_geom = nearest_points(new_valid_zone, orig_point_at_t)[0]
                     closest_pos = Position(closest_geom.x, closest_geom.y)
@@ -238,53 +259,19 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     console.print(f"[yellow]判定时间微调：note @ {base_sec} of (pos={base_pos},rot={base_rot})=> note @ {new_time} of (pos={closest_pos},rot={new_rot})[/yellow]")
                     return new_time, closest_pos, new_rot, new_offset, True
         
-        console.print(f"[yellow]判定微调失败：note @ {base_sec} of (pos={base_pos},rot={base_rot})[/yellow]")
+        console.print(f"[red]判定微调失败：note @ {base_sec} of (pos={base_pos},rot={base_rot})[/red]")
         return base_sec, base_pos, base_rot, note_offset, False
-
-    def in_pause_zone(pos: Position) -> bool:
-        return pos.real >= screen.width * 0.85 and pos.imag <= screen.height * 0.05
-
-    for line in chart.lines:
-        for note in line.notes:
-            if note.type == NoteType.TAP:
-                t_sec = note.seconds
-                rot = cmath.exp((line.angle @ t_sec) * 1j)
-                pos = (line.position @ t_sec) + rot * note.offset
-                tap_times_positions.append((round(t_sec * 1000), pos))
 
     def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, start_off: int) -> Position:
         rate = 1 - 2 * (offset_ms - start_off) / flick_duration
-        p1 = pos + rot * f_dir * screen.flick_radius
-        p2 = pos - rot * f_dir * screen.flick_radius
-        margin_x = screen.width * 0.05
-        margin_y = screen.height * 0.05
-        limit_min_x = margin_x
-        limit_max_x = screen.width - margin_x
-        limit_min_y = margin_y
-        limit_max_y = screen.height - margin_y
-        shift_x = 0.0
-        shift_y = 0.0
-        max_x = max(p1.real, p2.real)
-        min_x = min(p1.real, p2.real)
-        if max_x > limit_max_x:
-            shift_x -= (max_x - limit_max_x)
-        if min_x < limit_min_x:
-            shift_x += (limit_min_x - min_x)
-        max_y = max(p1.imag, p2.imag)
-        min_y = min(p1.imag, p2.imag)
-        if max_y > limit_max_y:
-            shift_y -= (max_y - limit_max_y)
-        if min_y < limit_min_y:
-            shift_y += (limit_min_y - min_y)
-        shifted_center = pos + (shift_x + shift_y * 1j)
-        return shifted_center + rot * f_dir * screen.flick_radius * rate
+        return pos + rot * f_dir * screen.flick_radius * rate
 
     frames: defaultdict[int, list[SemiNote]] = defaultdict(list)
     dense_frame_sizes: defaultdict[int, int] = defaultdict(int)
     current_note_id = 0
+    
     for line in track(chart.lines, description='统计帧...', console=console):
         for note in line.notes:
-            ts_ms = round(note.seconds * 1000)
             alpha = line.angle @ note.seconds
             rotation: Vector = cmath.exp(alpha * 1j)
             line_pos = line.position @ note.seconds
@@ -292,112 +279,79 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             adj_time, adj_pos, adj_rot, adj_offset, adjusted = find_visible_pos(
                 note.seconds, note_pos, rotation, note.offset, line
             )
+            ts = round(adj_time * 1000)
             if note.type == NoteType.HOLD:
                 note_id_to_line[current_note_id] = line
                 note_id_to_offset[current_note_id] = adj_offset
             match note.type:
                 case NoteType.TAP:
-                    ts = round(adj_time * 1000)
                     frames[ts].append(SemiNote(SemiNoteType.TAP, adj_pos, current_note_id, adj_rot))
                     dense_frame_sizes[ts] += 1
                 case NoteType.DRAG:
-                    ts = round(adj_time * 1000)
                     frames[ts].append(SemiNote(SemiNoteType.DRAG, adj_pos, current_note_id, adj_rot))
                     dense_frame_sizes[ts] += 1
                 case NoteType.FLICK:
-                    base_ms = round(adj_time * 1000)
-                    def check_path_validity(f_dir):
-                        for off in (flick_start, flick_end, (flick_start + flick_end) // 2):
-                            p = flick_pos(adj_pos, off, adj_rot, f_dir, flick_start)
-                            if not screen.visible(p) or in_pause_zone(p):
-                                return False
-                        return True
-                    best_dir = flick_dir
-                    if not check_path_validity(flick_dir) and check_path_validity(-flick_dir):
-                        best_dir = -flick_dir
-                    t_start = note.seconds
-                    t_end = note.seconds + flick_duration / 1000.0
-                    pos_start = line.position @ t_start
-                    pos_end = line.position @ t_end
-                    line_vel = pos_end - pos_start
-                    if abs(line_vel) > 1e-5:
-                        dot_forward = ((adj_rot * best_dir) * line_vel.conjugate()).real
-                        dot_backward = ((adj_rot * -best_dir) * line_vel.conjugate()).real
-                        if dot_backward > dot_forward:
-                            best_dir = -best_dir
-                    curr_flick_start = flick_start
-                    curr_flick_end = flick_end
-                    half_w = screen.width / 18
-                    flick_down_ts = base_ms + curr_flick_start
-                    flick_start_pos = flick_pos(adj_pos, curr_flick_start, adj_rot, best_dir, curr_flick_start)
-                    for tap_ts, tap_pos in tap_times_positions:
-                        if abs(flick_start_pos - tap_pos) < half_w * 1.5:
-                            if tap_ts - 160 < flick_down_ts < tap_ts - 80:
-                                shift = (tap_ts - 80) - flick_down_ts + 5
-                                curr_flick_start += shift
-                                curr_flick_end += shift
-                                flick_down_ts = base_ms + curr_flick_start
-                                flick_start_pos = flick_pos(adj_pos, curr_flick_start, adj_rot, best_dir, curr_flick_start)
-                    frames[base_ms + curr_flick_start].append(
+                    flick_start_pos = flick_pos(adj_pos, flick_start, adj_rot, flick_dir, flick_start)
+                    frames[ts + flick_start].append(
                         SemiNote(SemiNoteType.FLICK_START, flick_start_pos, current_note_id, adj_rot)
                     )
-                    dense_frame_sizes[base_ms + curr_flick_start] += 1
-                    for off in range(curr_flick_start + 1, curr_flick_end, sample_delay):
-                        rot = cmath.exp(line.angle @ ((base_ms + off) / 1000) * 1j)
-                        frames[base_ms + off].append(
+                    dense_frame_sizes[ts + flick_start] += 1
+                    for off in range(flick_start + 1, flick_end, sample_delay):
+                        rot = cmath.exp(line.angle @ ((ts + off) / 1000.0) * 1j)
+                        frames[ts + off].append(
                             SemiNote(SemiNoteType.FLICK,
-                                     flick_pos(adj_pos, off, rot, best_dir, curr_flick_start), current_note_id, rot))
-                        dense_frame_sizes[base_ms + off] += 1
-                    rot_end = cmath.exp(line.angle @ ((base_ms + curr_flick_end) / 1000) * 1j)
-                    frames[base_ms + curr_flick_end].append(
+                                     flick_pos(adj_pos, off, rot, flick_dir, flick_start), current_note_id, rot))
+                        dense_frame_sizes[ts + off] += 1
+                    rot_end = cmath.exp(line.angle @ ((ts + flick_end) / 1000.0) * 1j)
+                    frames[ts + flick_end].append(
                         SemiNote(SemiNoteType.FLICK_END,
-                                 flick_pos(adj_pos, curr_flick_end, rot_end, best_dir, curr_flick_start), current_note_id, rot_end))
-                    dense_frame_sizes[base_ms + curr_flick_end] += 1
+                                 flick_pos(adj_pos, flick_end, rot_end, flick_dir, flick_start), current_note_id, rot_end))
+                    dense_frame_sizes[ts + flick_end] += 1
                 case NoteType.HOLD:
                     hold_ms = math.ceil(note.hold * 1000)
-                    base_ms = round(adj_time * 1000)
-                    frames[base_ms].append(
+                    frames[ts].append(
                         SemiNote(SemiNoteType.HOLD_START, adj_pos, current_note_id, adj_rot))
-                    dense_frame_sizes[base_ms] += 1
+                    dense_frame_sizes[ts] += 1
                     p_touch = adj_pos
                     for off in range(1, hold_ms, sample_delay):
-                        t = ((base_ms + off) // sample_delay) * sample_delay
-                        t = max(base_ms, min(t, base_ms + hold_ms)) / 1000.0
+                        t = ((ts + off) // sample_delay) * sample_delay
+                        t = max(ts, min(t, ts + hold_ms)) / 1000.0
                         ang = line.angle @ t
                         rot = cmath.exp(ang * 1j)
                         pos = line.pos(t, adj_offset)
-                        dense_frame_sizes[base_ms + off] += 1
-                        area_t = JudgeArea(pos, rot, screen.width, screen.height)
-                        valid_zone_t = area_t.get_valid_poly(screen_poly, pause_poly)
+                        area = JudgeArea(pos, rot, screen.width, screen.height)
+                        valid_zone_t = area.get_valid_poly(screen_poly, pause_poly)
+                        p_touch = pos
                         if not valid_zone_t.is_empty:
                             orig_point = Point(pos.real, pos.imag)
                             closest_geom = nearest_points(valid_zone_t, orig_point)[0]
                             p_touch = Position(closest_geom.x, closest_geom.y)
-                        else:
-                            p_touch = pos
-                        frames[base_ms + off].append(
-                            SemiNote(SemiNoteType.HOLD, p_touch, current_note_id, rot)) 
-                    t2 = (base_ms + hold_ms) / 1000
-                    ang2 = line.angle @ t2
-                    rot2 = cmath.exp(ang2 * 1j)
-                    end_pos = line.pos(t2, adj_offset)
-                    frames[base_ms + hold_ms].append(
+                        frames[int(round(t * 1000))].append(
+                            SemiNote(SemiNoteType.HOLD, p_touch, current_note_id, rot))
+                        dense_frame_sizes[int(round(t * 1000))] += 1
+                    t2 = (ts + hold_ms) / 1000.0
+                    rot2 = cmath.exp((line.angle @ t2) * 1j)
+                    end_pos = p_touch
+                    end_pos_raw = line.pos(t2, adj_offset)
+                    area_end = JudgeArea(end_pos_raw, rot2, screen.width, screen.height)
+                    valid_zone_end = area_end.get_valid_poly(screen_poly, pause_poly)
+                    if not valid_zone_end.is_empty:
+                        orig_point_end = Point(end_pos_raw.real, end_pos_raw.imag)
+                        closest_geom_end = nearest_points(valid_zone_end, orig_point_end)[0]
+                        end_pos = Position(closest_geom_end.x, closest_geom_end.y)
+                    frames[ts + hold_ms].append(
                         SemiNote(SemiNoteType.HOLD_END, end_pos, current_note_id, rot2))
-                    dense_frame_sizes[base_ms + hold_ms] += 1
+                    dense_frame_sizes[ts + hold_ms] += 1
 
             current_note_id += 1
     
     for line in chart.lines:
         for note in line.notes:
+            start_ms = round(note.seconds * 1000)
             if note.type == NoteType.HOLD:
-                start_ms = round(note.seconds * 1000)
-                hold_ms = math.ceil(note.hold * 1000)
-                hold_ranges.append((start_ms, start_ms + hold_ms, -1))
+                hold_ranges.append((start_ms, start_ms + math.ceil(note.hold * 1000), -1))
             elif note.type == NoteType.FLICK:
-                start_ms = round(note.seconds * 1000)
-                flick_act_start = start_ms + flick_start
-                flick_act_end = start_ms + flick_end
-                flick_ranges.append((flick_act_start, flick_act_end))
+                flick_ranges.append((start_ms + flick_start, start_ms + flick_end))
 
     ranges = hold_ranges + [(s, e, -1) for s, e in flick_ranges]
     if ranges:
@@ -446,8 +400,16 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             elif note.type in (SemiNoteType.HOLD, SemiNoteType.DRAG):
                 passive_notes.append(note)
         
+        active_areas = [
+            JudgeArea(n.position, n.rotation, screen.width, screen.height)
+            for n in must_notes
+        ]
         active_polys = [
-            JudgeArea(n.position, n.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
+            area.get_valid_poly(screen_poly, pause_poly)
+            for area in active_areas
+        ]
+        must_circles = [
+            Point(n.position.real, n.position.imag).buffer(screen.width * 0.118125)
             for n in must_notes
         ]
         must_targets = [n.position for n in must_notes]
@@ -458,12 +420,20 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 for j in range(i + 1, len(must_notes)):
                     pi = Point(must_targets[i].real, must_targets[i].imag)
                     pj = Point(must_targets[j].real, must_targets[j].imag)
-                    if active_polys[i].contains(pj) or active_polys[j].contains(pi):
+                    inter_poly = active_polys[i].intersection(active_polys[j])
+                    risk = False
+                    if not inter_poly.is_empty:
+                        if inter_poly.intersects(must_circles[i]) or inter_poly.intersects(must_circles[j]):
+                            risk = True
+                    if risk:
                         zone_i = active_polys[i].difference(active_polys[j])
                         zone_j = active_polys[j].difference(active_polys[i])
-                        if zone_i.area >= a_min and zone_j.area >= a_min:
+                        is_valid_i = active_areas[i].is_valid_zone(zone_i, screen.width)
+                        is_valid_j = active_areas[j].is_valid_zone(zone_j, screen.width)
+                        if is_valid_i and is_valid_j:
                             active_polys[i] = zone_i
                             active_polys[j] = zone_j
+                            # representative_point 确保在判定区域内部
                             pt_i = zone_i.representative_point()
                             pt_j = zone_j.representative_point()
                             must_targets[i] = Position(pt_i.x, pt_i.y)
@@ -473,14 +443,13 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                                 f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => note(pos={must_targets[i]}) | note(pos={must_targets[j]})[/yellow]"
                             )
                         else:
-                            inter_zone = active_polys[i].intersection(active_polys[j])
-                            if not inter_zone.is_empty:
-                                pt_c = inter_zone.representative_point()
+                            if not inter_poly.is_empty:
+                                pt_c = inter_poly.representative_point()
                                 target_c = Position(pt_c.x, pt_c.y)
                                 must_targets[i] = target_c
                                 must_targets[j] = target_c
-                                active_polys[i] = inter_zone
-                                active_polys[j] = inter_zone
+                                active_polys[i] = inter_poly
+                                active_polys[j] = inter_poly
                                 changed = True
                                 console.print(
                                 f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => 2x note(pos={target_c})[/yellow]"
@@ -496,8 +465,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 line_ref=line_ref,
                 note_offset=offset_val
             )
-            act = TouchAction.DOWN if is_down else TouchAction.MOVE
-            result[timestamp].append(VirtualTouchEvent(target, act, pid))
+            result[timestamp].append(VirtualTouchEvent(target, TouchAction.DOWN, pid))
             if note.type == SemiNoteType.TAP:
                 to_free.append(note)
             confirmed_pointers[pid] = target
@@ -510,15 +478,19 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             line_ref = note_id_to_line.get(note.id)
             offset_val = note_id_to_offset.get(note.id, 0.0)
             poly_n = JudgeArea(note.position, note.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
+            candidates = []
             covering_pid = None
             covering_pos = None
             for pid, p_touch in current_touches.items():
                 if pid in flicking_pids:
                     continue
-                if poly_n.intersects(Point(p_touch.real, p_touch.imag)):  
-                    covering_pid = pid
-                    covering_pos = p_touch
-                    break
+                if poly_n.intersects(Point(p_touch.real, p_touch.imag)):
+                    dist = abs(p_touch - note.position)
+                    candidates.append((dist, pid, p_touch))
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                covering_pid = candidates[0][1]
+                covering_pos = candidates[0][2]
             if covering_pid is not None:
                 pointers.occupied[note.id] = PointerRecord(covering_pid, note.position, timestamp, line_ref, offset_val, note.type)
                 result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, covering_pid))
@@ -546,7 +518,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
                     to_free.append(note)
                     confirmed_pointers[pid] = note.position
-        active_touches = [ptr.position for ptr in pointers.occupied.values()]
         current_touches = active_physical_touches.copy()
         current_touches.update(confirmed_pointers)
         for note in passive_notes:
