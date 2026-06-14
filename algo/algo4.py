@@ -197,6 +197,13 @@ class PointerManager:
         for ptr in itertools.chain(self.unused.values(), self.occupied.values()):
             yield ptr, self.current_ts + 10
 
+class SweepTarget:
+    __slots__ = ('note', 'poly', 'is_swept')
+    def __init__(self, note: SemiNote, poly: Polygon) -> None:
+        self.note = note
+        self.poly = poly
+        self.is_swept = False
+
 def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
     screen = ScreenUtil(chart.width, chart.height)
     flick_start = config['algo1_flick_start']
@@ -225,6 +232,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     max_frame_may = 0
     note_id_to_line: dict[NoteID, Any] = {}
     note_id_to_offset: dict[NoteID, float] = {}
+    sweep_registry: defaultdict[int, list[SweepTarget]] = defaultdict(list)
+    deferred_flicks: list[dict] = []
 
     def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj) -> tuple[float, Position, Vector, float, bool]:
         area_obj = JudgeArea(base_pos, base_rot, screen.width, screen.height)
@@ -243,7 +252,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
 
         for dt in range(1, 16):
             for sign in (-1, 1):
-                new_time = base_sec + (dt * 0.001) * sign
+                new_time = base_sec + (dt / 1000.0) * sign
                 new_lp = line_obj.position @ new_time
                 new_alpha = line_obj.angle @ new_time
                 new_rot = cmath.exp(new_alpha * 1j)
@@ -265,10 +274,13 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, start_off: int) -> Position:
         rate = 1 - 2 * (offset_ms - start_off) / flick_duration
         return pos + rot * f_dir * screen.flick_radius * rate
-
+    
     frames: defaultdict[int, list[SemiNote]] = defaultdict(list)
     dense_frame_sizes: defaultdict[int, int] = defaultdict(int)
     current_note_id = 0
+    flick_eval_offsets = [flick_start] + list(range(flick_start + 1, flick_end, sample_delay))
+    if flick_eval_offsets[-1] != flick_end:
+        flick_eval_offsets.append(flick_end)
     
     for line in track(chart.lines, description='统计帧...', console=console):
         for note in line.notes:
@@ -288,47 +300,33 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     frames[ts].append(SemiNote(SemiNoteType.TAP, adj_pos, current_note_id, adj_rot))
                     dense_frame_sizes[ts] += 1
                 case NoteType.DRAG:
-                    frames[ts].append(SemiNote(SemiNoteType.DRAG, adj_pos, current_note_id, adj_rot))
-                    dense_frame_sizes[ts] += 1
+                    area = JudgeArea(adj_pos, adj_rot, screen.width, screen.height)
+                    poly = area.get_valid_poly(screen_poly, pause_poly)
+                    sn = SemiNote(SemiNoteType.DRAG, adj_pos, current_note_id, adj_rot)
+                    sweep_registry[ts].append(SweepTarget(sn, poly))
                 case NoteType.FLICK:
-                    flick_start_pos = flick_pos(adj_pos, flick_start, adj_rot, flick_dir, flick_start)
-                    frames[ts + flick_start].append(
-                        SemiNote(SemiNoteType.FLICK_START, flick_start_pos, current_note_id, adj_rot)
-                    )
-                    dense_frame_sizes[ts + flick_start] += 1
-                    for off in range(flick_start + 1, flick_end, sample_delay):
-                        rot = cmath.exp(line.angle @ ((ts + off) / 1000.0) * 1j)
-                        frames[ts + off].append(
-                            SemiNote(SemiNoteType.FLICK,
-                                     flick_pos(adj_pos, off, rot, flick_dir, flick_start), current_note_id, rot))
-                        dense_frame_sizes[ts + off] += 1
-                    rot_end = cmath.exp(line.angle @ ((ts + flick_end) / 1000.0) * 1j)
-                    frames[ts + flick_end].append(
-                        SemiNote(SemiNoteType.FLICK_END,
-                                 flick_pos(adj_pos, flick_end, rot_end, flick_dir, flick_start), current_note_id, rot_end))
-                    dense_frame_sizes[ts + flick_end] += 1
+                    deferred_flicks.append({
+                        'ts': ts, 'pos': adj_pos, 'rot': adj_rot, 'id': current_note_id, 'line': line
+                    })
                 case NoteType.HOLD:
                     hold_ms = math.ceil(note.hold * 1000)
-                    frames[ts].append(
-                        SemiNote(SemiNoteType.HOLD_START, adj_pos, current_note_id, adj_rot))
+                    frames[ts].append(SemiNote(SemiNoteType.HOLD_START, adj_pos, current_note_id, adj_rot))
                     dense_frame_sizes[ts] += 1
                     p_touch = adj_pos
                     for off in range(1, hold_ms, sample_delay):
                         t = ((ts + off) // sample_delay) * sample_delay
                         t = max(ts, min(t, ts + hold_ms)) / 1000.0
                         ang = line.angle @ t
-                        rot = cmath.exp(ang * 1j)
+                        rot_t = cmath.exp(ang * 1j)
                         pos = line.pos(t, adj_offset)
-                        area = JudgeArea(pos, rot, screen.width, screen.height)
+                        area = JudgeArea(pos, rot_t, screen.width, screen.height)
                         valid_zone_t = area.get_valid_poly(screen_poly, pause_poly)
                         p_touch = pos
                         if not valid_zone_t.is_empty:
                             orig_point = Point(pos.real, pos.imag)
-                            closest_geom = nearest_points(valid_zone_t, orig_point)[0]
-                            p_touch = Position(closest_geom.x, closest_geom.y)
-                        frames[int(round(t * 1000))].append(
-                            SemiNote(SemiNoteType.HOLD, p_touch, current_note_id, rot))
-                        dense_frame_sizes[int(round(t * 1000))] += 1
+                            p_touch = Position(nearest_points(valid_zone_t, orig_point)[0].x, nearest_points(valid_zone_t, orig_point)[0].y)
+                        sn = SemiNote(SemiNoteType.HOLD, p_touch, current_note_id, rot_t)
+                        sweep_registry[int(round(t * 1000))].append(SweepTarget(sn, valid_zone_t))
                     t2 = (ts + hold_ms) / 1000.0
                     rot2 = cmath.exp((line.angle @ t2) * 1j)
                     end_pos = p_touch
@@ -337,13 +335,71 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     valid_zone_end = area_end.get_valid_poly(screen_poly, pause_poly)
                     if not valid_zone_end.is_empty:
                         orig_point_end = Point(end_pos_raw.real, end_pos_raw.imag)
-                        closest_geom_end = nearest_points(valid_zone_end, orig_point_end)[0]
-                        end_pos = Position(closest_geom_end.x, closest_geom_end.y)
-                    frames[ts + hold_ms].append(
-                        SemiNote(SemiNoteType.HOLD_END, end_pos, current_note_id, rot2))
+                        end_pos = Position(nearest_points(valid_zone_end, orig_point_end)[0].x, nearest_points(valid_zone_end, orig_point_end)[0].y)
+                    frames[ts + hold_ms].append(SemiNote(SemiNoteType.HOLD_END, end_pos, current_note_id, rot2))
                     dense_frame_sizes[ts + hold_ms] += 1
 
             current_note_id += 1
+    
+    for f_info in track(deferred_flicks, description='规划滑动轨迹...', console=console):
+        base_ts, base_pos, base_rot = f_info['ts'], f_info['pos'], f_info['rot']
+        nid, line = f_info['id'], f_info['line']
+        candidates_targets = []
+        for off in flick_eval_offsets:
+            for target in sweep_registry.get(base_ts + off, []):
+                if not target.is_swept:
+                    candidates_targets.append((base_ts + off, target, off))
+        candidate_dirs = [flick_dir, -flick_dir]
+        for tick_ts, target, off in candidates_targets:
+            rate = 1 - 2 * (off - flick_start) / flick_duration
+            if abs(rate) < 1e-3: 
+                continue
+            rot_t = cmath.exp((line.angle @ (tick_ts / 1000.0)) * 1j)
+            vec = (target.note.position - base_pos) / (rot_t * screen.flick_radius * rate)
+            if abs(vec) > 0:
+                candidate_dirs.append(vec / abs(vec))
+        best_dir = flick_dir
+        max_swept = -1
+        best_swept_targets = []
+        for c_dir in candidate_dirs:
+            is_valid = True
+            current_swept = []
+            for off in flick_eval_offsets:
+                tick_ts = base_ts + off
+                rot_t = cmath.exp((line.angle @ (tick_ts / 1000.0)) * 1j)
+                p_flick = flick_pos(base_pos, off, rot_t, c_dir, flick_start)
+                test_area = JudgeArea(p_flick, rot_t, screen.width, screen.height)
+                test_poly = test_area.get_valid_poly(screen_poly, pause_poly)
+                if not test_area.is_valid_zone(test_poly, screen.width):
+                    is_valid = False
+                    break
+                test_point = Point(p_flick.real, p_flick.imag)
+                for target in sweep_registry.get(tick_ts, []):
+                    if not target.is_swept and target.poly.intersects(test_point):
+                        current_swept.append(target)
+            if is_valid and len(current_swept) > max_swept:
+                max_swept = len(current_swept)
+                best_dir = c_dir
+                best_swept_targets = current_swept
+        if max_swept == -1: 
+            best_dir = flick_dir
+        for target in best_swept_targets:
+            target.is_swept = True
+        for off in flick_eval_offsets:
+            tick_ts = base_ts + off
+            rot_t = cmath.exp((line.angle @ (tick_ts / 1000.0)) * 1j)
+            p_flick = flick_pos(base_pos, off, rot_t, best_dir, flick_start)
+            if off == flick_start:
+                frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_START, p_flick, nid, rot_t))
+            elif off == flick_end:
+                frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_END, p_flick, nid, rot_t))
+            else:
+                frames[tick_ts].append(SemiNote(SemiNoteType.FLICK, p_flick, nid, rot_t))
+            dense_frame_sizes[tick_ts] += 1
+    for ts, targets in sweep_registry.items():
+        for target in targets:
+            frames[ts].append(target.note)
+            dense_frame_sizes[ts] += 1
     
     for line in chart.lines:
         for note in line.notes:
