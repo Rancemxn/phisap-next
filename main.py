@@ -128,6 +128,7 @@ class SolveWorker(QThread):
             screen, ans = self.algo.solve(self.chart, self.config, self.console)
             self.solved.emit(screen, ans)
         except Exception as e:
+            self.console.print_exception(show_locals=False)
             self.error.emit(e)
 
 class AutoplayScrcpyWorker(QThread):
@@ -874,7 +875,6 @@ class MainWindow(QWidget):
                 box.setText(self.tr('Done.'))
                 box.exec()
             def on_error(e):
-                self.console.print_exception(show_locals=False)
                 self.testButton.setDisabled(False)
                 self.testButton.setText(self.tr("Execute"))
             self.solve_worker.solved.connect(on_solved)
@@ -951,6 +951,7 @@ class MainWindow(QWidget):
         self.goButton.clicked.connect(self.autoplay)
         self.onSyncModeChanged(self.syncModeSelector.checkedId())
         self.delayLabel.setText(self.tr("Delay:"))
+        self.goButton.setDisabled(False)
 
     def autoplay(self) -> None:
         try:
@@ -1017,7 +1018,6 @@ class MainWindow(QWidget):
                     self.goButton.setText(self.tr("Prepare"))
                     start_playback(screen, ans)
                 def on_error(e):
-                    self.console.print_exception(show_locals=False)
                     self.goButton.setDisabled(False)
                     self.goButton.setText(self.tr("Prepare"))
                     self.restore()

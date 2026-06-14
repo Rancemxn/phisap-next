@@ -366,6 +366,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             base_ts, base_pos, base_rot = f_info['ts'], f_info['pos'], f_info['rot']
             nid, line = f_info['id'], f_info['line']
             candidates_targets = []
+            # 这里整块逻辑都不能追踪flick的偏转，必须以判定时间为准
+            # 不然有的绑线flick判定时间后就飞走了，计算出来的flick_pos就不是直线了
             for off in flick_eval_offsets:
                 for target in sweep_registry.get(base_ts + off, []):
                     if not target.is_swept:
@@ -375,8 +377,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 rate = 1 - 2 * (off - flick_start) / flick_duration
                 if abs(rate) < 1e-3: 
                     continue
-                rot_t = cmath.exp((line.angle @ (tick_ts / 1000.0)) * 1j)
-                vec = (target.note.position - base_pos) / (rot_t * screen.flick_radius * rate)
+                vec = (target.note.position - base_pos) / (base_rot * screen.flick_radius * rate)
                 if abs(vec) > 0:
                     candidate_dirs.append(vec / abs(vec))
             best_dir = flick_dir
@@ -387,9 +388,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 current_swept = []
                 for off in flick_eval_offsets:
                     tick_ts = base_ts + off
-                    rot_t = cmath.exp((line.angle @ (tick_ts / 1000.0)) * 1j)
-                    p_flick = flick_pos(base_pos, off, rot_t, c_dir, flick_start)
-                    test_area = JudgeArea(p_flick, rot_t, screen.width, screen.height)
+                    p_flick = flick_pos(base_pos, off, base_rot, c_dir, flick_start)
+                    test_area = JudgeArea(p_flick, base_rot, screen.width, screen.height)
                     test_poly = test_area.get_valid_poly(screen_poly, pause_poly)
                     if not test_area.is_valid_zone(test_poly, screen.width):
                         is_valid = False
@@ -402,20 +402,19 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     max_swept = len(current_swept)
                     best_dir = c_dir
                     best_swept_targets = current_swept
-            if max_swept == -1: 
+            if max_swept == -1:
                 best_dir = flick_dir
             for target in best_swept_targets:
                 target.is_swept = True
             for off in flick_eval_offsets:
                 tick_ts = base_ts + off
-                rot_t = cmath.exp((line.angle @ (tick_ts / 1000.0)) * 1j)
-                p_flick = flick_pos(base_pos, off, rot_t, best_dir, flick_start)
+                p_flick = flick_pos(base_pos, off, base_rot, best_dir, flick_start)
                 if off == flick_start:
-                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_START, p_flick, nid, rot_t))
+                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_START, p_flick, nid, base_rot))
                 elif off == flick_end:
-                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_END, p_flick, nid, rot_t))
+                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_END, p_flick, nid, base_rot))
                 else:
-                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK, p_flick, nid, rot_t))
+                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK, p_flick, nid, base_rot))
                 dense_frame_sizes[tick_ts] += 1
             progress.advance(task2, 1)
         
@@ -585,6 +584,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                     confirmed_pointers[pid] = note.position
                     current_touches[pid] = note.position
+                    flicking_pids.add(pid)
             for note in active_never:
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
