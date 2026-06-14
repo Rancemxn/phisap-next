@@ -598,6 +598,10 @@ class MainWindow(QWidget):
         self.settings = QSettings('./.settings.ini', QSettings.Format.IniFormat)
         self.loadSettings()
 
+    def closeEvent(self, event):
+        self.saveSettings()
+        event.accept()
+
     def loadSettings(self) -> None:
         for key, info in self.SETTINGS.items():
             if isinstance(info, tuple):
