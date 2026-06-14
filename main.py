@@ -112,6 +112,23 @@ class ExtractPackageWorker(QThread):
         super().__init__(parent)
         self.packagePath = packagePath
 
+class SolveWorker(QThread):
+    solved = Signal(object, object)
+    error = Signal(Exception)
+
+    def __init__(self, algo, chart, config, console, parent=None):
+        super().__init__(parent)
+        self.algo = algo
+        self.chart = chart
+        self.config = config
+        self.console = console
+
+    def run(self):
+        try:
+            screen, ans = self.algo.solve(self.chart, self.config, self.console)
+            self.solved.emit(screen, ans)
+        except Exception as e:
+            self.error.emit(e)
 
 class AutoplayScrcpyWorker(QThread):
     controller: ScrcpyController
@@ -305,6 +322,7 @@ class MainWindow(QWidget):
         self.autoplayWorker = None
         self.extractPackageWorker = None
         self.extractProgressDialog = None
+        self.solve_worker = None
         self.controller = None
 
         self.setMinimumWidth(300)
@@ -598,8 +616,28 @@ class MainWindow(QWidget):
         self.settings = QSettings('./.settings.ini', QSettings.Format.IniFormat)
         self.loadSettings()
 
-    def closeEvent(self, event):
-        self.saveSettings()
+        self.onBackendChanged(self.backendSelection.checkedId())
+        self.onSyncModeChanged(self.syncModeSelector.checkedId())
+
+    def closeEvent(self, event) -> None:
+        if self.controller:
+            try:
+                self.controller.clean()
+            except Exception:
+                pass
+
+        if self.extractPackageWorker and self.extractPackageWorker.isRunning():
+            self.extractPackageWorker.cancel()
+            self.extractPackageWorker.wait()
+
+        if self.solve_worker and self.solve_worker.isRunning():
+            import os
+            os._exit(0)
+
+        if self.autoplayWorker and self.autoplayWorker.isRunning():
+            self.autoplayWorker.stop()
+            self.autoplayWorker.wait()
+
         event.accept()
 
     def loadSettings(self) -> None:
@@ -813,11 +851,10 @@ class MainWindow(QWidget):
     def process(self) -> None:
         self.saveSettings()
         self.testButton.setDisabled(True)
+        self.testButton.setText(self.tr("Calculating..."))
         try:
             algoIndex = self.algorithmSelectorTabs.currentIndex()
             content, chart = self.loadChart()
-            screen: ScreenUtil
-            ans: RawAnswerType
             if algoIndex == 0:
                 import algo.algo1 as algo
             elif algoIndex == 1:
@@ -826,16 +863,27 @@ class MainWindow(QWidget):
                 import algo.algo3 as algo
             else:
                 import algo.algo4 as algo
-            screen, ans = algo.solve(chart, self.getAlgorithmConfigureDict(), self.console)
-            if self.saveResult.isChecked():
-                self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
-            box = QMessageBox(self)
-            box.setText(self.tr('Done.'))
-            box.exec()
+                
+            self.solve_worker = SolveWorker(algo, chart, self.getAlgorithmConfigureDict(), self.console, self)
+            def on_solved(screen, ans):
+                if self.saveResult.isChecked():
+                    self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
+                self.testButton.setDisabled(False)
+                self.testButton.setText(self.tr("Execute"))
+                box = QMessageBox(self)
+                box.setText(self.tr('Done.'))
+                box.exec()
+            def on_error(e):
+                self.console.print_exception(show_locals=False)
+                self.testButton.setDisabled(False)
+                self.testButton.setText(self.tr("Execute"))
+            self.solve_worker.solved.connect(on_solved)
+            self.solve_worker.error.connect(on_error)
+            self.solve_worker.start()
         except Exception:
             self.console.print_exception(show_locals=False)
-        finally:
             self.testButton.setDisabled(False)
+            self.testButton.setText(self.tr("Execute"))
 
     def refreshDevices(self) -> None:
         self.deviceSerialSelector.clear()
@@ -857,6 +905,7 @@ class MainWindow(QWidget):
                 self.deviceSerialSelector.addItems(devices)
                 if self.mainModeSelectTabs.count() <= 1:
                     self.mainModeSelectTabs.insertTab(0, self.autoplayView, self.tr('Autoplay'))
+                self.mainModeSelectTabs.setCurrentIndex(0)
         except Exception:
             pass
 
@@ -871,6 +920,19 @@ class MainWindow(QWidget):
         if serial == self.tr('No device found'):
             return
 
+        backend = self.backendSelection.checkedId()
+
+        mismatch = False
+        if self.controller:
+            if backend == 0 and not isinstance(self.controller, ScrcpyController):
+                mismatch = True
+            elif backend == 1 and not isinstance(self.controller, HIDController):
+                mismatch = True
+        
+        if mismatch:
+            self.controller.clean()
+            self.controller = None
+
         # skip recreation if the same serial is already in use
         if self.controller and self.controller.serial == serial:
             return
@@ -881,20 +943,62 @@ class MainWindow(QWidget):
         elif backend == 1:
             self.controller = HIDController((self.deviceWidthInput.value(), self.deviceHeightInput.value()), serial)
 
+    def restore(self):
+        try:
+            self.goButton.clicked.disconnect()
+        except Exception:
+            pass
+        self.goButton.clicked.connect(self.autoplay)
+        self.onSyncModeChanged(self.syncModeSelector.checkedId())
+        self.delayLabel.setText(self.tr("Delay:"))
+
     def autoplay(self) -> None:
         try:
             self.saveSettings()
             content, chart = self.loadChart()
             algoIndex = self.algorithmSelectorTabs.currentIndex()
-            ans: RawAnswerType
-            screen: ScreenUtil
             cacheData: bytes | None = None
-
             if self.preferCache.isChecked():
                 cacheData = self.cacheManager.find_cache_for_content(content)
 
+            def start_playback(screen, ans):
+                try:
+                    assert self.controller is not None
+                    self.controller.connect()
+                    self.delayLabel.setText(self.tr('Offset:'))
+                    adaptedAns = self.controller.preprocess(screen, ans)
+                    ansIter = iter(adaptedAns)
+                    if self.syncModeSelector.checkedId() == 0:
+                        # Manual
+                        delay = -adaptedAns[0][0]
+                        self.lastDelayValue = self.delayInput.value()
+                        def waitForBegin():
+                            if not self.autoplayWorker:
+                                return
+                            self.prepareBeforeAutoplay()
+                        self.goButton.setText(self.tr('Go!'))
+                        self.goButton.clicked.disconnect(self.autoplay)
+                        self.goButton.clicked.connect(waitForBegin)
+                    else:
+                        # Delay
+                        self.lastDelayValue = self.delayInput.value()
+                        delay = self.lastDelayValue
+                        self.controller.tap_center()
+
+                    backend = self.backendSelection.checkedId()
+                    playSpeed = self.playSpeedInput.value()
+                    if backend == 0:
+                        self.autoplayWorker = AutoplayScrcpyWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
+                    elif backend == 1:
+                        self.autoplayWorker = AutoplayHIDWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
+                    if self.syncModeSelector.checkedId() == 1:
+                        self.prepareBeforeAutoplay()
+                except Exception:
+                    self.console.print_exception(show_locals=False)
+                    self.restore()
             if cacheData is not None:
                 screen, ans = load_data(cacheData)
+                start_playback(screen, ans)
             else:
                 if algoIndex == 0:
                     import algo.algo1 as algo
@@ -904,53 +1008,26 @@ class MainWindow(QWidget):
                     import algo.algo3 as algo
                 else:
                     import algo.algo4 as algo
-                screen, ans = algo.solve(chart, self.getAlgorithmConfigureDict(), self.console)
-                self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
-
-            assert self.controller is not None
-            self.controller.connect()
-
-            self.delayLabel.setText(self.tr('Offset:'))
-            delay = None
-            adaptedAns = self.controller.preprocess(screen, ans)
-            ansIter = iter(adaptedAns)
-            if self.syncModeSelector.checkedId() == 0:
-                # Manual
-                delay = -adaptedAns[0][0]
-                self.lastDelayValue = self.delayInput.value()
-
-                def waitForBegin():
-                    if not self.autoplayWorker:
-                        return
-                    self.prepareBeforeAutoplay()
-
-                self.goButton.setText(self.tr('Go!'))
-                self.goButton.clicked.disconnect(self.autoplay)
-                self.goButton.clicked.connect(waitForBegin)
-            else:
-                # Delay
-                self.lastDelayValue = self.delayInput.value()
-                delay = self.lastDelayValue
-                self.controller.tap_center()
-        
-            backend = self.backendSelection.checkedId()
-            playSpeed = self.playSpeedInput.value()
-            if backend == 0:
-                self.autoplayWorker = AutoplayScrcpyWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
-            elif backend == 1:
-                self.autoplayWorker = AutoplayHIDWorker(ansIter, delay, playSpeed, self.controller, self)  # type: ignore
-
-            if self.syncModeSelector.checkedId() == 1:
-                self.prepareBeforeAutoplay()
-
-
+                
+                self.goButton.setDisabled(True)
+                self.solve_worker = SolveWorker(algo, chart, self.getAlgorithmConfigureDict(), self.console, self)
+                def on_solved(screen, ans):
+                    self.cacheManager.write_cache_of_content(content, dump_data(screen, ans))
+                    self.goButton.setDisabled(False)
+                    self.goButton.setText(self.tr("Prepare"))
+                    start_playback(screen, ans)
+                def on_error(e):
+                    self.console.print_exception(show_locals=False)
+                    self.goButton.setDisabled(False)
+                    self.goButton.setText(self.tr("Prepare"))
+                    self.restore()
+                self.solve_worker.solved.connect(on_solved)
+                self.solve_worker.error.connect(on_error)
+                self.solve_worker.start()
         except Exception:
             self.console.print_exception(show_locals=False)
-            # Restore UI state
-            self.goButton.clicked.disconnect()
-            self.goButton.clicked.connect(self.autoplay)
-            self.onSyncModeChanged(self.syncModeSelector.checkedId())
-            self.delayLabel.setText(self.tr("Delay:"))
+            self.restore()
+    
     def prepareBeforeAutoplay(self) -> None:
         assert self.autoplayWorker is not None
         self.autoplayWorker.start()

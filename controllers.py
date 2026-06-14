@@ -255,13 +255,15 @@ class HIDController:
     def __init__(self, device_size: tuple[int, int], serial: str) -> None:
         self.serial = serial
         width, height = device_size
-        self.device_width = width
-        self.device_height = height
+        
+        self.device_width = min(width, height)
+        self.device_height = max(width, height)
+        
         desc_body = (
             self._REPORT_DESCRIPTION_BODY_P1
-            + struct.pack('H', width)
+            + struct.pack('H', self.device_width)
             + self._REPORT_DESCRIPTION_BODY_P2
-            + struct.pack('H', height)
+            + struct.pack('H', self.device_height)
             + self._REPORT_DESCRIPTION_BODY_P3
         )
         self._report_description = self._REPORT_DESCRIPTION_HEAD + desc_body * 10 + self._REPORT_DESCRIPTION_TAIL
@@ -284,14 +286,38 @@ class HIDController:
         self.disconnect()
 
     def reset_touches(self) -> None:
-        pass
+        try:
+            self._send_hid_event(self._gen_event_data({}))
+        except Exception:
+            pass
 
     def connect(self) -> None:
+        try:
+            if self._device.is_kernel_driver_active(0):
+                self._device.detach_kernel_driver(0)
+        except Exception:
+            pass
+        try:
+            proto = self._device.ctrl_transfer(128, 51, 0, 0, 2)
+            if int.from_bytes(proto, 'little') >= 2:
+                self._device.ctrl_transfer(64, 52, 0, 0, b"phisap\x00")
+                self._device.ctrl_transfer(64, 52, 0, 1, b"Controller\x00")
+                self._device.ctrl_transfer(64, 52, 0, 2, b"Description\x00")
+                self._device.ctrl_transfer(64, 52, 0, 3, b"1.0\x00")
+                self._device.ctrl_transfer(64, 53, 0, 0, None)
+                time.sleep(0.5)
+                self._find_device(self.serial)
+        except Exception:
+            pass
+
         self._register_hid()
         self._set_hid_report_description()
 
     def disconnect(self) -> None:
-        self._unregister_hid()
+        try:
+            self._unregister_hid()
+        except Exception:
+            pass
 
     @staticmethod
     def _finger_event(id: int, on_screen: bool, x: int, y: int) -> bytes:
@@ -309,35 +335,21 @@ class HIDController:
         return res
 
     def _register_hid(self):
-        self._device.ctrl_transfer(
-            64,  # ENDPOINT_OUT | REQUEST_TYPE_VENDOR
-            54,  # ACCESSORY_REGISTER_HID
-            self.accessory_id,
-            len(self._report_description),
-        )  # fmt: skip
+        self._device.ctrl_transfer(64, 54, self.accessory_id, len(self._report_description))
 
     def _unregister_hid(self):
-        self._device.ctrl_transfer(
-            64,  # ENDPOINT_OUT | REQUEST_TYPE_VENDOR
-            55,  # ACCESSORY_UNREGISTER_ID
-            self.accessory_id, 0
-        )  # fmt: skip
+        self._device.ctrl_transfer(64, 55, self.accessory_id, 0)
 
     def _set_hid_report_description(self):
-        self._device.ctrl_transfer(
-            64,  # ENDPOINT_OUT | REQUEST_TYPE_VENDOR
-            56,  # ACCESSORY_SET_HID_REPORT_DESC
-            self.accessory_id,
-            0,
-            self._report_description,
-        )  # fmt: skip
+        chunk_size = 64
+        for offset in range(0, len(self._report_description), chunk_size):
+            chunk = self._report_description[offset:offset+chunk_size]
+            self._device.ctrl_transfer(
+                64, 56, self.accessory_id, offset, chunk
+            )
 
     def _send_hid_event(self, event: bytes):
-        self._device.ctrl_transfer(
-            64,  # ENDPOINT_OUT | REQUEST_TYPE_VENDOR
-            57,  # ACCESSORY_SEND_HID_EVENT
-            self.accessory_id, 0, event
-        )  # fmt: skip
+        self._device.ctrl_transfer(64, 57, self.accessory_id, 0, event)
 
     def send(self, event: bytes):
         self._send_hid_event(event)
@@ -345,37 +357,47 @@ class HIDController:
     def preprocess(self, screen: ScreenUtil, answer: RawAnswerType) -> list[ViscousAnswerItem]:
         res = []
         current_fingers: dict[int, tuple[int, int]] = {}
-        short_edge = min(self.device_width, self.device_height)
-        long_edge = max(self.device_width, self.device_height)
-        medium_edge = short_edge // screen.height * screen.width
-        offset_x = (long_edge - medium_edge) >> 1
+        
+        short_edge = self.device_width
+        long_edge = self.device_height
+        
+        scale_y = short_edge / screen.height
+        scale_x = scale_y
+        
+        medium_edge = screen.width * scale_x
+        offset_x = (long_edge - medium_edge) / 2
         offset_y = 0
-        scale_x = medium_edge // screen.width
-        scale_y = short_edge // screen.height
-        # 动态分配指针ID
+
         pointer_id_map = {}
         ids = set(range(10))
+        
         for timestamp, events in answer:
-            operated = set()
             for event in events:
-                if event.pointer_id not in pointer_id_map:
-                    pointer_id_map[event.pointer_id] = ids.pop()
-                pointer_id = pointer_id_map[event.pointer_id]
-                x = round(event.pos.real * scale_x) + offset_x
-                y = round(event.pos.imag * scale_y) + offset_y
-                x, y = self.device_width - y, x
-                assert pointer_id not in operated
-                operated.add(pointer_id)
+                if event.action == TouchAction.DOWN:
+                    if event.pointer_id not in pointer_id_map:
+                        pointer_id_map[event.pointer_id] = ids.pop()
+                
+                pointer_id = pointer_id_map.get(event.pointer_id, 0)
+                
+                lx = event.pos.real * scale_x + offset_x
+                ly = event.pos.imag * scale_y + offset_y
+                
+                px = round(short_edge - ly)
+                py = round(lx)
+                
+                px = max(0, min(short_edge - 1, px))
+                py = max(0, min(long_edge - 1, py))
+                
                 match event.action:
-                    case TouchAction.DOWN:
-                        assert pointer_id not in current_fingers
-                        current_fingers[pointer_id] = (x, y)
-                    case TouchAction.MOVE:
-                        assert pointer_id in current_fingers
-                        current_fingers[pointer_id] = (x, y)
+                    case TouchAction.DOWN | TouchAction.MOVE:
+                        current_fingers[pointer_id] = (px, py)
                     case TouchAction.UP:
-                        assert pointer_id in current_fingers
-                        del current_fingers[pointer_id]
+                        if pointer_id in current_fingers:
+                            del current_fingers[pointer_id]
+                        if event.pointer_id in pointer_id_map:
+                            released_id = pointer_id_map.pop(event.pointer_id)
+                            ids.add(released_id)
+                            
             res.append((timestamp, self._gen_event_data(current_fingers)))
         return res
 
@@ -396,6 +418,8 @@ class HIDController:
                 if isinstance(serial_number, str):
                     res.append(serial_number)
             except ValueError:
+                pass
+            except Exception:
                 pass
         return res
 

@@ -157,12 +157,15 @@ class PointerManager:
             return pid, True
         if self.unused:
             ptr = min(self.unused.values(), key=lambda p: abs(note.position - p.position))
-            del self.unused[ptr.id]
-            prev_active = ptr.timestamp
-            if self.current_ts > prev_active + 1:
-                up_ts = (prev_active + self.current_ts) // 2
+            if self.current_ts > ptr.timestamp + 1:
+                up_ts = (ptr.timestamp + self.current_ts) // 2
             else:
-                up_ts = self.current_ts - 1
+                ptr = min(self.unused.values(), key=lambda p: p.timestamp)
+                if self.current_ts > ptr.timestamp + 1:
+                    up_ts = (ptr.timestamp + self.current_ts) // 2
+                else:
+                    up_ts = self.current_ts - 1
+            del self.unused[ptr.id]
             up_ts = max(0, up_ts)
             self.waiting_liftup.append((ptr, up_ts))
             self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
@@ -639,7 +642,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     for ptr, up_ts in pointers.finish():
         result[up_ts].append(VirtualTouchEvent(ptr.position, TouchAction.UP, ptr.id))
     
-    console.print('重构规划完毕.')
+    console.print(f'重构规划完毕，总事件数{sum(len(events) for events in result.values())}.')
     return screen, [(ts, events) for ts, events in sorted(result.items())]
 
 __all__ = ['solve']
