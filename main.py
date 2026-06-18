@@ -45,7 +45,7 @@ from pgr import PgrChart
 from pec import PecChart
 from rpe import RpeChart
 
-PHISAP_VERSION = '0.20'
+PHISAP_VERSION = '0.21'
 
 
 class ExtractPackageWorker(QThread):
