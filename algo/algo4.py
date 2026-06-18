@@ -476,9 +476,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     must_notes.append(note)
                 elif note.type == SemiNoteType.FLICK_START:
                     may_notes.append(note)
-                elif note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END, SemiNoteType.HOLD_END):
+                elif note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END):
                     active_never.append(note)
-                elif note.type in (SemiNoteType.HOLD, SemiNoteType.DRAG):
+                elif note.type in (SemiNoteType.HOLD, SemiNoteType.DRAG, SemiNoteType.HOLD_END):
                     passive_notes.append(note)
             
             active_areas = [
@@ -594,12 +594,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     if note.type == SemiNoteType.FLICK_END:
                         to_free.append(note)
                     confirmed_pointers[pid] = note.position
-                elif note.type == SemiNoteType.HOLD_END:
-                    if note.id in pointers.occupied:
-                        pid, _ = pointers.alloc(note, line_ref=line_ref, note_offset=offset_val)
-                        result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
-                        to_free.append(note)
-                        confirmed_pointers[pid] = note.position
             current_touches = active_physical_touches.copy()
             current_touches.update(confirmed_pointers)
             for note in passive_notes:
@@ -625,7 +619,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         break
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
-                
                 if is_covered:
                     if note.type == SemiNoteType.DRAG:
                         continue
@@ -634,11 +627,16 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                             if note.id in pointers.occupied:
                                 pointers.free(note)
                             pointers.occupied[note.id] = PointerRecord(covering_pid, covering_pos, timestamp, line_ref, offset_val, note.type)
-                elif note.type == SemiNoteType.HOLD and is_self_covered:
+                    elif note.type == SemiNoteType.HOLD_END:
+                        if note.id in pointers.occupied:
+                            to_free.append(note)
+                elif note.type in (SemiNoteType.HOLD, SemiNoteType.HOLD_END) and is_self_covered:
                     pointers.occupied[note.id] = PointerRecord(self_pid, self_record.position, timestamp, line_ref, offset_val, note.type)
                     pointers.last_active_ts[self_pid] = timestamp
                     confirmed_pointers[self_pid] = self_record.position
                     current_touches[self_pid] = self_record.position
+                    if note.type == SemiNoteType.HOLD_END:
+                        to_free.append(note)
                 else:
                     if note.type == SemiNoteType.DRAG:
                         pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
@@ -647,7 +645,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         to_free.append(note)
                         confirmed_pointers[pid] = note.position
                         current_touches[pid] = note.position 
-                    elif note.type == SemiNoteType.HOLD:
+                    elif note.type in (SemiNoteType.HOLD, SemiNoteType.HOLD_END):
                         if note.id in pointers.occupied:
                             pointers.free(note)
                         pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
@@ -655,6 +653,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                         confirmed_pointers[pid] = note.position
                         current_touches[pid] = note.position
+                        if note.type == SemiNoteType.HOLD_END:
+                            to_free.append(note)
             
             for note_to_free in to_free:
                 pointers.free(note_to_free)
