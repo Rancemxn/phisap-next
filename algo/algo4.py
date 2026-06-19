@@ -15,7 +15,9 @@ from shapely import (
     intersection,
     intersects,
     distance,
-    centroid
+    centroid,
+    difference,
+    get_parts
 )
 from shapely.ops import nearest_points
 from shapely.affinity import rotate
@@ -105,10 +107,7 @@ class JudgeArea:
         if valid_poly.is_empty:
             return False
         min_dim = self.w_judge * 0.8
-        if isinstance(valid_poly, MultiPolygon):
-            geoms = list(valid_poly.geoms)
-        else:
-            geoms = [valid_poly]
+        geoms = get_parts(valid_poly)
         angle_deg = -math.degrees(cmath.phase(self.rotation))
         for geom in geoms:
             if geom.is_empty:
@@ -469,6 +468,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             t_sec = timestamp / 1000.0
             for nid, record in pointers.occupied.items():
                 active_physical_touches[record.id] = record.position
+            for pid, record in pointers.unused.items():
+                active_physical_touches[pid] = record.position
             
             current_touches = active_physical_touches.copy()
             for note in frame:
@@ -489,10 +490,11 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 area.get_valid_poly(screen_poly, pause_poly)
                 for area in active_areas
             ]
-            must_circles = [
-                Point(n.position.real, n.position.imag).buffer(screen.width * 0.118125)
+            original_must_points = [
+                Point(n.position.real, n.position.imag)
                 for n in must_notes
             ]
+            collision_radius = screen.width * 0.118125
             must_targets = [n.position for n in must_notes]
             max_iters = 5
             for iter_idx in range(max_iters):
@@ -501,14 +503,15 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     for j in range(i + 1, len(must_notes)):
                         pi = Point(must_targets[i].real, must_targets[i].imag)
                         pj = Point(must_targets[j].real, must_targets[j].imag)
-                        inter_poly = active_polys[i].intersection(active_polys[j])
+                        inter_poly = intersection(active_polys[i], active_polys[j])
                         risk = False
                         if not inter_poly.is_empty:
-                            if inter_poly.intersects(must_circles[i]) or inter_poly.intersects(must_circles[j]):
+                            if (distance(inter_poly, original_must_points[i]) <= collision_radius or 
+                                    distance(inter_poly, original_must_points[j]) <= collision_radius):
                                 risk = True
                         if risk:
-                            zone_i = active_polys[i].difference(active_polys[j])
-                            zone_j = active_polys[j].difference(active_polys[i])
+                            zone_i = difference(active_polys[i], active_polys[j])
+                            zone_j = difference(active_polys[j], active_polys[i])
                             is_valid_i = active_areas[i].is_valid_zone(zone_i, screen.width)
                             is_valid_j = active_areas[j].is_valid_zone(zone_j, screen.width)
                             if is_valid_i and is_valid_j:
@@ -533,8 +536,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                                     active_polys[j] = inter_poly
                                     changed = True
                                     console.print(
-                                    f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => 2x note(pos={target_c})[/yellow]"
-                                )
+                                        f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => 2x note(pos={target_c})[/yellow]"
+                                    )
                 if not changed:
                     break
             
@@ -573,6 +576,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     covering_pid = candidates[0][1]
                     covering_pos = candidates[0][2]
                 if covering_pid is not None:
+                    if covering_pid in pointers.unused:
+                        del pointers.unused[covering_pid]
                     pointers.occupied[note.id] = PointerRecord(covering_pid, note.position, timestamp, line_ref, offset_val, note.type)
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, covering_pid))
                     confirmed_pointers[covering_pid] = note.position
@@ -621,11 +626,25 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 offset_val = note_id_to_offset.get(note.id, 0.0)
                 if is_covered:
                     if note.type == SemiNoteType.DRAG:
+                        # unused 随时可能被拿走，需要临时occupied一下
+                        if covering_pid in pointers.unused:
+                            del pointers.unused[covering_pid]
+                            pointers.occupied[note.id] = PointerRecord(
+                                id=covering_pid, 
+                                position=covering_pos, 
+                                timestamp=timestamp, 
+                                line_ref=line_ref, 
+                                note_offset=offset_val, 
+                                note_type=note.type
+                            )
+                            to_free.append(note)
                         continue
                     elif note.type == SemiNoteType.HOLD:
                         if covering_pid is not None:
                             if note.id in pointers.occupied:
                                 pointers.free(note)
+                            if covering_pid in pointers.unused:
+                                del pointers.unused[covering_pid]
                             pointers.occupied[note.id] = PointerRecord(covering_pid, covering_pos, timestamp, line_ref, offset_val, note.type)
                     elif note.type == SemiNoteType.HOLD_END:
                         if note.id in pointers.occupied:
