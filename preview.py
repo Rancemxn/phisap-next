@@ -244,7 +244,8 @@ def pg():
     print("    0 - Reset")
     print("    Arrows - Seek 0.01/0.1s")
     print("    ,/. - Seek 0.001s")
-    print("    =/- - Speed")
+    print("    G/H - Seek -10s/+10s")
+    print("    =/- - Speed Tier")
     print("    ESC - Exit")
     print()
 
@@ -286,7 +287,11 @@ class CW(QWidget):
         s.paused = False
         s.ct = 0.0
         s.lr = time.monotonic()
-        s.sp = 1.0
+        
+        s.speeds = [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
+        s.speed_idx = s.speeds.index(1.0)
+        s.sp = s.speeds[s.speed_idx]
+        
         s.kd = {}
         s.ft = skia.Font(skia.Typeface.MakeFromName("Arial", skia.FontStyle.Normal()), 20)
         s.fl = skia.Font(skia.Typeface.MakeFromName("Arial", skia.FontStyle.Bold()), 13)
@@ -360,11 +365,9 @@ class CW(QWidget):
                 if chart_now > n.time and not is_hold:
                     base_op *= max(0.0, 1.0 - (chart_now - n.time) / 0.16)
                     
-                # 从 NC 配置中读取对应的 RGB 值
                 r, g, b = NC.get(n.t, (100, 100, 100))
                 
                 paint_fill = skia.Paint()
-                # 动态合并色值和计算得到的 alpha 混合度，创建新 skia.Color
                 paint_fill.setColor(skia.Color(r, g, b, int(base_op * 255)))
                 paint_fill.setStyle(skia.Paint.kFill_Style)
                 paint_fill.setAntiAlias(True)
@@ -426,7 +429,7 @@ class CW(QWidget):
                     c.drawString(str(pid), sx + PR + 8, sy + 5, s.fl, lp)
                     
         tp = skia.Paint(skia.Color(255, 255, 255))
-        c.drawString(f"{int(now * 1000)}ms  x{s.sp:.1f}", 8, 22, s.ft, tp)
+        c.drawString(f"{int(now * 1000)}ms  {s.sp}x", 8, 22, s.ft, tp)
         
         sts = s.psm.get_states()
         for i, pid in enumerate(sorted(sts)):
@@ -452,10 +455,26 @@ class CW(QWidget):
             s.ct = 0.0
             s.psm.reset()
             if not s.paused: s.lr = time.monotonic()
+        
         elif k in (Qt.Key_Equal, Qt.Key_Plus):
-            s.sp = min(4.0, s.sp + .25)
+            if s.speed_idx < len(s.speeds) - 1:
+                s.speed_idx += 1
+                s.sp = s.speeds[s.speed_idx]
         elif k == Qt.Key_Minus:
-            s.sp = max(.05, s.sp - .25)
+            if s.speed_idx > 0:
+                s.speed_idx -= 1
+                s.sp = s.speeds[s.speed_idx]
+                
+        elif k == Qt.Key_G:
+            s.ct = max(0.0, s.ct - 10.0)
+            s.psm.reset()
+            if not s.paused: s.lr = time.monotonic()
+            
+        elif k == Qt.Key_H:
+            s.ct += 10.0
+            s.psm.reset()
+            if not s.paused: s.lr = time.monotonic()
+            
         elif k in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Comma, Qt.Key_Period, Qt.Key_Up, Qt.Key_Down):
             s.kd[k] = True
             if not s.paused: s.paused = True
@@ -489,8 +508,12 @@ def cdc():
     return {
         "algo1_flick_start": -20, "algo1_flick_end": 20, "algo1_flick_direction": 0,
         "algo1_sample_delay": 5, "algo1_target_score": 1000000, "algo1_strict_mode": True,
+        
         "algo2_flick_start": 20, "algo2_flick_end": -20, "algo2_flick_direction": 0,
-        "algo2_target_score": 1000000, "algo2_strict_mode": True, "algo2_continue_when_failed": False
+        "algo2_target_score": 1000000, "algo2_strict_mode": True, "algo2_continue_when_failed": False,
+        
+        "algo4_flick_start": -20, "algo4_flick_end": 20, "algo4_flick_direction": 0,
+        "algo4_sample_delay": 5, "algo4_continue_when_failed": True
     }
 
 def main():

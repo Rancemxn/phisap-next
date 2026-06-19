@@ -66,14 +66,6 @@ class SemiNote(NamedTuple):
     id: NoteID
     rotation: Vector
 
-class PointerRecord(NamedTuple):
-    id: PointerID
-    position: Position
-    timestamp: int
-    line_ref: Any = None
-    note_offset: float = 0.0
-    note_type: SemiNoteType | None = None
-
 class JudgeArea:
     __slots__ = ('center', 'rotation', 'poly', 'w_judge')
 
@@ -120,18 +112,28 @@ class JudgeArea:
                 return True
         return False
 
-class PointerManager:
-    __slots__ = ('occupied', 'idle', 'unused', 'last_active_ts', 'waiting_liftup', 'current_ts')
+class PointerRecord(NamedTuple):
+    id: PointerID
+    position: Position
+    timestamp: int
+    line_ref: Any = None
+    note_offset: float = 0.0
+    note_type: SemiNoteType | None = None
 
-    def __init__(self, pointer_ids: Iterable[PointerID]) -> None:
+class PointerManager:
+    __slots__ = ('occupied', 'idle', 'unused', 'last_active_ts', 'waiting_liftup', 'current_ts', 'console', 'noway')
+
+    def __init__(self, pointer_ids: Iterable[PointerID], console: Console, noway: bool = False) -> None:
         self.occupied: dict[NoteID, PointerRecord] = {}
         self.idle: set[PointerID] = set(pointer_ids)
         self.unused: dict[PointerID, PointerRecord] = {}
         self.last_active_ts: dict[PointerID, int] = {pid: 0 for pid in pointer_ids}
         self.waiting_liftup: list[tuple[PointerRecord, int]] = []
         self.current_ts: int = 0
+        self.console: Console = console
+        self.noway: bool = noway
 
-    def alloc(self, note: SemiNote, new: bool = True, line_ref: Any = None, note_offset: float = 0.0) -> tuple[PointerID, bool]:
+    def alloc(self, note: SemiNote, new: bool = True, line_ref: Any = None, note_offset: float = 0.0) -> tuple[PointerID | None, bool]:
         nid = note.id
         if nid in self.occupied:
             ptr = self.occupied[nid]
@@ -172,7 +174,10 @@ class PointerManager:
             self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
             self.last_active_ts[ptr.id] = self.current_ts
             return ptr.id, True
-
+        
+        if self.noway:
+            self.console.print(f"[red]Note({note}) @ {self.current_ts} 规划失败[/red]")
+            return None, False
         raise RuntimeError(f'no free pointers @ {self.current_ts}')
 
     def free(self, note: SemiNote) -> None:
@@ -210,12 +215,14 @@ class SweepTarget:
 
 def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
     screen = ScreenUtil(chart.width, chart.height)
-    flick_start = config['algo1_flick_start']
-    flick_end = config['algo1_flick_end']
-    sample_delay = config['algo1_sample_delay']
+    flick_start = config['algo4_flick_start']
+    flick_end = config['algo4_flick_end']
+    sample_delay = config['algo4_sample_delay']
+    noway = config['algo4_continue_when_failed']
+    flick_dir = 1j if config['algo4_flick_direction'] == 0 else 1
     flick_duration = flick_end - flick_start
-    padding_x = screen.width * 0.03 
-    padding_y = screen.height * 0.03
+    padding_x = screen.width * 0.05
+    padding_y = screen.height * 0.05
     screen_poly = Polygon([
         (padding_x, padding_y), 
         (screen.width - padding_x, padding_y), 
@@ -228,7 +235,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         (screen.width * 0.95, screen.height * 0.10),
         (screen.width * 0.85, screen.height * 0.10)
     ])
-    flick_dir = 1j if config['algo1_flick_direction'] == 0 else 1
     hold_ranges: list[tuple[int, int, int]] = []
     flick_ranges: list[tuple[int, int]] = []
     max_concurrent_holds = 0
@@ -448,7 +454,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         pointers_count = max(pointers_count, max_dense_frame)
         pointers_count = min(10, pointers_count + 1)
         console.print(f'统计完毕，当前谱面共计{len(frames)}帧，最多需要{pointers_count}押')
-        pointers = PointerManager(range(1000, 1000 + pointers_count))
+        pointers = PointerManager(range(1000, 1000 + pointers_count), console, noway=noway)
         sorted_frames = sorted(frames.items())
         total_frames = len(sorted_frames)
         task3 = progress.add_task("规划触控事件...", total=total_frames)
@@ -490,11 +496,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 area.get_valid_poly(screen_poly, pause_poly)
                 for area in active_areas
             ]
-            original_must_points = [
-                Point(n.position.real, n.position.imag)
-                for n in must_notes
-            ]
-            collision_radius = screen.width * 0.118125
             must_targets = [n.position for n in must_notes]
             max_iters = 5
             for iter_idx in range(max_iters):
@@ -504,12 +505,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         pi = Point(must_targets[i].real, must_targets[i].imag)
                         pj = Point(must_targets[j].real, must_targets[j].imag)
                         inter_poly = intersection(active_polys[i], active_polys[j])
-                        risk = False
                         if not inter_poly.is_empty:
-                            if (distance(inter_poly, original_must_points[i]) <= collision_radius or 
-                                    distance(inter_poly, original_must_points[j]) <= collision_radius):
-                                risk = True
-                        if risk:
                             zone_i = difference(active_polys[i], active_polys[j])
                             zone_j = difference(active_polys[j], active_polys[i])
                             is_valid_i = active_areas[i].is_valid_zone(zone_i, screen.width)
@@ -549,6 +545,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     line_ref=line_ref,
                     note_offset=offset_val
                 )
+                if pid is None:
+                    continue
                 result[timestamp].append(VirtualTouchEvent(target, TouchAction.DOWN, pid))
                 if note.type == SemiNoteType.TAP:
                     to_free.append(note)
@@ -585,6 +583,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     flicking_pids.add(covering_pid)
                 else:
                     pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
+                    if pid is None:
+                        continue
                     act = TouchAction.DOWN if is_down else TouchAction.MOVE
                     result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                     confirmed_pointers[pid] = note.position
@@ -595,6 +595,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 offset_val = note_id_to_offset.get(note.id, 0.0)
                 if note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END):
                     pid, _ = pointers.alloc(note, line_ref=line_ref, note_offset=offset_val)
+                    if pid is None:
+                        continue
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
                     if note.type == SemiNoteType.FLICK_END:
                         to_free.append(note)
@@ -659,6 +661,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 else:
                     if note.type == SemiNoteType.DRAG:
                         pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
+                        if pid is None:
+                            continue
                         act = TouchAction.DOWN if is_down else TouchAction.MOVE
                         result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                         to_free.append(note)
@@ -668,6 +672,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         if note.id in pointers.occupied:
                             pointers.free(note)
                         pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
+                        if pid is None:
+                            continue
                         act = TouchAction.DOWN if is_down else TouchAction.MOVE
                         result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
                         confirmed_pointers[pid] = note.position
