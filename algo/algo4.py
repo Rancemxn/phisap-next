@@ -314,9 +314,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     note.seconds, note_pos, rotation, note.offset, line
                 )
                 ts = round(adj_time * 1000)
-                if note.type == NoteType.HOLD:
-                    note_id_to_line[current_note_id] = line
-                    note_id_to_offset[current_note_id] = adj_offset
+                note_id_to_line[current_note_id] = line
+                note_id_to_offset[current_note_id] = adj_offset
                 match note.type:
                     case NoteType.TAP:
                         frames[ts].append(SemiNote(SemiNoteType.TAP, adj_pos, current_note_id, adj_rot))
@@ -423,6 +422,54 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 dense_frame_sizes[tick_ts] += 1
             progress.advance(task2, 1)
         
+        task3 = progress.add_task("平移超载帧...", total=len(frames))
+        for ts in sorted(list(frames.keys())):
+            while True:
+                must_may_notes = [
+                    n for n in frames[ts] 
+                    if n.type in (SemiNoteType.TAP, SemiNoteType.HOLD_START, SemiNoteType.FLICK_START)
+                ]
+                if len(frames[ts]) <= 10 or not must_may_notes:
+                    break
+                note_to_shift = must_may_notes[0]
+                nid = note_to_shift.id
+                line = note_id_to_line.get(nid)
+                orig_offset = note_id_to_offset.get(nid, 0.0)
+                best_target_ts = None
+                min_density = 999999
+                # 优先向前找，4ms一间隔
+                for dt in range(1, 11):
+                    for sign in (-4, 4): 
+                        target_ts = ts + dt * sign
+                        if target_ts < 0:
+                            continue
+                        density = len(frames[target_ts])
+                        if density < min_density and density < 10:
+                            min_density = density
+                            best_target_ts = target_ts
+                    if min_density < 10 - 2:
+                        break
+                if best_target_ts is not None:
+                    frames[ts].remove(note_to_shift)
+                    dense_frame_sizes[ts] -= 1
+                    t_sec = best_target_ts / 1000.0
+                    alpha = line.angle @ t_sec
+                    rot = cmath.exp(alpha * 1j)
+                    line_pos = line.position @ t_sec
+                    note_pos = line_pos + rot * orig_offset
+                    adj_time, adj_pos, adj_rot, adj_offset, adjusted = find_visible_pos(
+                        t_sec, note_pos, rot, orig_offset, line
+                    )
+                    final_ts = round(adj_time * 1000)
+                    shifted_note = SemiNote(note_to_shift.type, adj_pos, nid, adj_rot)
+                    frames[final_ts].append(shifted_note)
+                    dense_frame_sizes[final_ts] += 1
+                    note_id_to_offset[nid] = adj_offset
+                    console.print(f"[cyan]偏移note @ {ts} ({note_to_shift}) => note @ {ts} ({shifted_note})")
+                else:
+                    break
+            progress.advance(task3, 1)
+        
         for ts, targets in sweep_registry.items():
             for target in targets:
                 frames[ts].append(target.note)
@@ -457,7 +504,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         pointers = PointerManager(range(1000, 1000 + pointers_count), console, noway=noway)
         sorted_frames = sorted(frames.items())
         total_frames = len(sorted_frames)
-        task3 = progress.add_task("规划触控事件...", total=total_frames)
+        task4 = progress.add_task("规划触控事件...", total=total_frames)
 
         result: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
         for timestamp, frame in sorted_frames:
@@ -687,7 +734,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             for ptr, up_ts in pointers.recycle():
                 result[up_ts].append(VirtualTouchEvent(ptr.position, TouchAction.UP, ptr.id))
             
-            progress.advance(task3, 1)
+            progress.advance(task4, 1)
     
     for ptr, up_ts in pointers.finish():
         result[up_ts].append(VirtualTouchEvent(ptr.position, TouchAction.UP, ptr.id))
