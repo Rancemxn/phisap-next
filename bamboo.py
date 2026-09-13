@@ -3,7 +3,8 @@ from abc import ABCMeta, abstractmethod
 import bisect
 import math
 
-from easing import EasingFunction, LVALUE
+from easing import EasingFunction, LINEAR, LVALUE, RVALUE
+from functools import lru_cache
 
 # 泛型约束：可以插值（跟自己相加减，跟浮点数相乘除可以得到同类型结果）
 
@@ -13,16 +14,13 @@ S = TypeVar('S', bound='_Interpable')
 @runtime_checkable
 class _Interpable(Protocol):
     @abstractmethod
-    def __add__(self: S, other: S, /) -> S:
-        ...
+    def __add__(self: S, other: S, /) -> S: ...
 
     @abstractmethod
-    def __sub__(self: S, other: S, /) -> S:
-        ...
+    def __sub__(self: S, other: S, /) -> S: ...
 
     @abstractmethod
-    def __mul__(self: S, other: float | int, /) -> S:
-        ...
+    def __mul__(self: S, other: float | int, /) -> S: ...
 
 
 T = TypeVar('T', bound=_Interpable)
@@ -30,15 +28,13 @@ T = TypeVar('T', bound=_Interpable)
 
 class Bamboo(Generic[T], metaclass=ABCMeta):
     @abstractmethod
-    def __matmul__(self, time: float) -> T:
-        ...
+    def __matmul__(self, time: float) -> T: ...
 
     @abstractmethod
-    def __repr__(self) -> str:
-        ...
+    def __repr__(self) -> str: ...
 
 
-def equal(a: float, b: float) -> float:
+def equal(a: float, b: float) -> bool:
     return math.isclose(a, b)
 
 
@@ -60,10 +56,14 @@ class BrokenBamboo(Bamboo[T]):
         bisect.insort_left(self.segments, Segment(start, end, start_value, end_value), key=lambda s: s.start)
 
     def __matmul__(self, time: float) -> T:
-        right = bisect.bisect_left(self.segments, time, key=lambda s: s.start)
-        if right < len(self.segments) and equal(self.segments[right].start, time):
-            return self.segments[right].start_value
+        if not self.segments:
+            raise ValueError('cannot sample an empty BrokenBamboo')
+        right = bisect.bisect_right(self.segments, time, key=lambda s: s.start)
+        if right == 0:
+            return self.segments[0].start_value
         seg = self.segments[right - 1]
+        if time >= seg.end:
+            return seg.end_value
         t = (time - seg.start) / (seg.end - seg.start)
         return seg.start_value + (seg.end_value - seg.start_value) * t
 
@@ -208,3 +208,134 @@ class BambooShoot(Bamboo[T]):
 
     def __repr__(self) -> str:
         return f'BambooShoot({self.const})'
+
+
+class BambooFunc(Bamboo[T]):
+    def __init__(self, sample: Callable[[float], T]) -> None:
+        self.sample = sample
+
+    def __matmul__(self, time: float) -> T:
+        return self.sample(time)
+
+    def __repr__(self) -> str:
+        return 'BambooFunc()'
+
+
+class Event(NamedTuple, Generic[T]):
+    start: float
+    end: float
+    start_value: T
+    end_value: T
+    easing: EasingFunction = LINEAR
+
+# 保留事件自己的区间，避免插入下一事件时改变上一段的缓动
+
+class EventBamboo(Bamboo[T]):
+
+    def __init__(self, default: T, interpolate: Callable[[T, T, float], T] | None = None) -> None:
+        self.events: list[Event[T]] = []
+        self.default = default
+        self.interpolate = interpolate or (lambda a, b, t: a + (b - a) * t)
+        self._cache: tuple[float, T] | None = None
+
+    def cut(self, start: float, end: float, start_value: T, end_value: T, easing: EasingFunction = LINEAR) -> None:
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            raise ValueError(f'invalid event interval: [{start}, {end}]')
+        self._cache = None
+        event = Event(start, end, start_value, end_value, easing)
+        if not self.events or start >= self.events[-1].start:
+            self.events.append(event)
+        else:
+            bisect.insort_right(self.events, event, key=lambda e: e.start)
+
+    def event_at(self, time: float) -> Event[T] | None:
+        index = bisect.bisect_right(self.events, time, key=lambda e: e.start) - 1
+        return self.events[index] if index >= 0 else None
+
+    def __matmul__(self, time: float) -> T:
+        # 优化下，一帧中的音符会反复查询同一条线的位置、角度和透明度
+        cache = self._cache
+        if cache is not None and cache[0] == time:
+            return cache[1]
+        event = self.event_at(time)
+        if event is None:
+            return self.default
+        if time >= event.end:
+            value = self.interpolate(event.end_value, event.end_value, 1.0)
+        elif event.start_value == event.end_value:
+            value = self.interpolate(event.start_value, event.end_value, 0.0)
+        else:
+            t = event.easing((time - event.start) / (event.end - event.start))
+            value = self.interpolate(event.start_value, event.end_value, t)
+        self._cache = time, value
+        return value
+
+    def __repr__(self) -> str:
+        return f'EventBamboo(events={len(self.events)}, default={self.default})'
+
+
+@lru_cache(maxsize=4096)
+def easing_integral(easing: EasingFunction, start: float, end: float) -> float:
+    if easing is LINEAR:
+        return (end * end - start * start) / 2
+    if easing is LVALUE:
+        return 0.0
+    if easing is RVALUE:
+        return end - start
+    if integral := getattr(easing, 'integral', None):
+        return integral(start, end)
+
+    # 非线性速度只积分缓动的 [0, 1] 区间
+    def simpson(a, b, fa, fm, fb, area, tolerance, depth):
+        m = (a + b) / 2
+        fl, fr = easing((a + m) / 2), easing((m + b) / 2)
+        left = (m - a) * (fa + 4 * fl + fm) / 6
+        right = (b - m) * (fm + 4 * fr + fb) / 6
+        error = left + right - area
+        if depth == 0 or abs(error) <= 15 * tolerance:
+            return left + right + error / 15
+        return simpson(a, m, fa, fl, fm, left, tolerance / 2, depth - 1) + simpson(
+            m, b, fm, fr, fb, right, tolerance / 2, depth - 1
+        )
+
+    fa, fm, fb = easing(start), easing((start + end) / 2), easing(end)
+    area = (end - start) * (fa + 4 * fm + fb) / 6
+    return simpson(start, end, fa, fm, fb, area, 1e-8, 14)
+
+# 积分速度，以 0 秒为原点
+
+class IntegratedBamboo(Bamboo[float]):
+
+    def __init__(self, source: EventBamboo[float]) -> None:
+        self.source = source
+        self.times = sorted({0.0, *(e.start for e in source.events), *(e.end for e in source.events)})
+        self.floors = [0.0]
+        for start, end in zip(self.times, self.times[1:]):
+            self.floors.append(self.floors[-1] + self._integrate(start, end))
+        self.origin = self._value(0.0)
+
+    def _integrate(self, start: float, end: float) -> float:
+        event = self.source.event_at(start)
+        if event is None:
+            return self.source.default * (end - start)
+        if start >= event.end:
+            return event.end_value * (end - start)
+        if event.start_value == event.end_value:
+            return event.start_value * (end - start)
+        duration = event.end - event.start
+        a, b = (start - event.start) / duration, (end - event.start) / duration
+        return event.start_value * (end - start) + (event.end_value - event.start_value) * duration * easing_integral(
+            event.easing, a, b
+        )
+
+    def _value(self, time: float) -> float:
+        index = bisect.bisect_right(self.times, time) - 1
+        if index < 0:
+            return (time - self.times[0]) * self.source.default
+        return self.floors[index] + self._integrate(self.times[index], time)
+
+    def __matmul__(self, time: float) -> float:
+        return self._value(time) - self.origin
+
+    def __repr__(self) -> str:
+        return f'IntegratedBamboo(events={len(self.source.events)})'

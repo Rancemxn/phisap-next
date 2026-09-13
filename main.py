@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import typing
 import zipfile
 from pathlib import Path
@@ -41,11 +40,9 @@ from basis import Chart
 from cache_manager import CacheManager
 from controllers import ScrcpyController, HIDController, GranularAnswerItem, ViscousAnswerItem
 
-from pgr import PgrChart
-from pec import PecChart
-from rpe import RpeChart
+from chart import load_chart
 
-PHISAP_VERSION = '0.21'
+PHISAP_VERSION = '0.22'
 
 
 class ExtractPackageWorker(QThread):
@@ -812,20 +809,12 @@ class MainWindow(QWidget):
             return selectedIndex, Path(self.customChartPath.text())
 
     def loadChart(self) -> tuple[str, Chart]:
-        selection, chartPath = self.getSelectedPath()
-        content = chartPath.open(encoding='utf-8').read()
-        chart: Chart
+        _, chartPath = self.getSelectedPath()
+        content = chartPath.read_text(encoding='utf-8-sig')
         ratio = (16, 9) if self.aspectRatioSelector.checkedId() == 0 else (4, 3)
-        if selection == 0:
-            chart = PgrChart(json.loads(content), ratio)
-        else:
-            try:
-                if chartPath.name.endswith('.pec'):
-                    raise json.decoder.JSONDecodeError('Not a json file', '<>', 0)
-                j = json.loads(content)
-                chart = RpeChart(j, ratio) if 'META' in j else PgrChart(j, ratio)
-            except json.decoder.JSONDecodeError:
-                chart = PecChart(content, ratio)
+        chart = load_chart(content, ratio, chartPath)
+        for warning in chart.warnings:
+            self.console.print(f'Warning: {warning}', markup=False)
         return content, chart
 
     def getAlgorithmConfigureDict(self) -> AlgorithmConfigure:

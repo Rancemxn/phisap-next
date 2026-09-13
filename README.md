@@ -75,7 +75,7 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
 
 ### 准备
 
-0. **请安装 Python 3.12 和 uv**
+0. **请安装 Python 3.13 和 uv**
    
    - 请使用正式版，**不要使用开发者预览(early developer preview)版**
 1. 使用`uv sync`安装依赖
@@ -107,7 +107,7 @@ _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权
 
 ```bash
 cd phisap # 将CWD(Current Working Directory，当前工作目录)设置为phisap的根目录，以便phisap查找服务端文件
-python main.py
+uv run main.py
 ```
 
 ## 工作原理
@@ -196,17 +196,9 @@ phisap 并没有对课题模式做特殊的支持，将来也许会有
 - 官谱
   - 完全支持
 - PEC 格式
-  - 支持所有指令
-  - 暂不能很好处理事件之间相互重叠的情况
-    - 例如：
-      - 事件一：起始于时间 A，终止于时间 C
-      - 事件二：起始于时间 B，终止于时间 D
-      - A < B < C < D
+  - 完全支持
 - RPE 格式
-  - 忽略 ID 为 30 以上的 easingType
-  - 忽略`posControl`、`skewControl`、`yControl`以及所有的`extendedEvents`(`inclineEvents`、`scaleXEvents`和`scaleYEvents`)，但可以正确解析它们
-
-请注意：对 pec 和 rpe 的支持目前正在开发中，处于初期阶段，实际体验可能并不理想。如果你发现了 phisap 不支持的谱面，可以开一个 issue，并附上必要信息
+  - 完全支持
 
 ## 致谢
 
@@ -224,6 +216,29 @@ phisap 并没有对课题模式做特殊的支持，将来也许会有
 图标仅限phisap项目本身使用，其他任何人或团体不得以任何方式使用，原作者 @ShintoKosei 保留所有权利
 
 ## 更新日志
+
+### (2026/09/13) v0.2.2
+
+- **正式支持RPE，PEC**
+  - 大一统了一下谱面读取和时间换算的东西，现在全由`chart.py`和`timing.py`处理
+  - RPE 支持了 bpmfactor、多事件层、父子判定线，算是把之前的TODO完成了
+  - 新增 RPE 的1到29号缓动，以及贝塞尔曲线，修复了下坐标解析错误的问题
+  - 根据 `RPEVersion` 处理不同版本的速度缓动，这部分与主流的相同
+  - 完全重写PEC解析器，然后内容同RPE
+- **完成Preview.py**
+  - 现在preview.py对官谱和PEC，RPE都支持了。渲染也是正常的
+  - 而且在求值的时候加入了缓存功能，现在渲染也十分丝滑
+  - 加入了算法选择的参数。algo 1,2,3,4都可以。也可以关闭算法显示
+  - ~~我说这怎么都不像预览的工具了吧~~
+  - 右上角还增加了坐标显示，可以直接展示鼠标当前的坐标。现在把指针指到note上就可以调试了
+  - Hold的渲染终于也是没问题了，把倒流什么的都搞成了
+  - 同时把假音符，透明度，文字的也端了上来
+  - 总之已经完全可用，先这样
+- 更新Python版本到3.13
+- 更新了下README.md，现在直接使用`uv`启动而不是Python
+- **修复缓存复用的问题**
+  - 之前无论什么算法缓存都只用一个，而且改了算法缓存还是用之前的
+  - 现在修复之后会先校验一下SHA，相同的再复用
 
 ### (2026/06/14) v0.2.1
 

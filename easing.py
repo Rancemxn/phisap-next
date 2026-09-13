@@ -1,27 +1,24 @@
 from typing import Callable
 from types import CodeType, FunctionType
-from enum import Enum
+from enum import Enum, member
 from functools import partial
-from math import pi, sin, cos, sqrt
-
-import numpy as np
+from math import pi, sin, cos, sqrt, isclose
+import bisect
 
 
 def _easing_linear(
     start: tuple[float, float, float], end: tuple[float, float, float], t: float
 ) -> tuple[float, float, float]:
-    return tuple(np.array(np.mat((1 - t, t)) @ np.mat((start, end)))[0])
+    return tuple(a + (b - a) * t for a, b in zip(start, end))
 
 
 def _easing_cubic_bezier(
     start: tuple[float, float, float], end: tuple[float, float, float], t: float
 ) -> tuple[float, float, float]:
-    mult = np.eye(3) * (1 - t) * (1 + 2 * t)
-    mult[1, 1] = 1.0
-    start = (np.array(start) @ mult).tolist()
-    mult = np.eye(3) * t * (3 - 2 * t)
-    mult[1, 1] = 1
-    end = (np.array(end) @ mult).tolist()
+    a = (1 - t) * (1 + 2 * t)
+    b = t * (3 - 2 * t)
+    start = (start[0] * a, start[1], start[2] * a)
+    end = (end[0] * b, end[1], end[2] * b)
     return _easing_linear(start, end, t)
 
 
@@ -46,11 +43,11 @@ def _easing_sinus(
 
 
 def _in(expr: str) -> str:
-    return f'1 - ({expr.replace("x", "(1 - x)")})'
+    return expr
 
 
 def _out(expr: str) -> str:
-    return expr
+    return f'1 - ({expr.replace("x", "(1 - x)")})'
 
 
 def _inout(expr: str) -> str:
@@ -63,17 +60,19 @@ def _outin(expr: str) -> str:
 
 _EASING_BASIC_FUNCTIONS = {
     'linear': 'x',
-    'sine': 'sin(x * pi / 2)',
+    'sine': '1 - cos(x * pi / 2)',
     'quad': 'x ** 2',
     'cubic': 'x ** 3',
     'quart': 'x ** 4',
     'quint': 'x ** 5',
     'circ': '1 - sqrt(1 - x * x)',
-    'expo': '2. ** (10 * x - 10)',
+    'expo': '0 if x == 0 else 2. ** (10 * x - 10)',
     'back': '(2.70158 * x - 1.70158) * x ** 2',
-    'elastic': f'-(2 ** (10 * x - 10) * sin({2 * pi / 3} * (x * 10. - 10.75)))',
-    'bounce': f'A * x ** 2 if x < {1 / 2.75} else (A * (x - {1.5 / 2.75}) ** 2 + 0.75 if x < {2 / 2.75} else (A * (x - {2.25 / 2.75}) ** 2 + 0.9375 if x < {2.5 / 2.75} else A * (x - {2.625 / 2.75}) ** 2 + 0.984375))'.replace(
-        'A', str(7.5625)
+    'elastic': f'x if x == 0 or x == 1 else -(2 ** (10 * x - 10) * sin({2 * pi / 3} * (x * 10. - 10.75)))',
+    'bounce': _out(
+        f'A * x ** 2 if x < {1 / 2.75} else (A * (x - {1.5 / 2.75}) ** 2 + 0.75 if x < {2 / 2.75} else (A * (x - {2.25 / 2.75}) ** 2 + 0.9375 if x < {2.5 / 2.75} else A * (x - {2.625 / 2.75}) ** 2 + 0.984375))'.replace(
+            'A', str(7.5625)
+        )
     ),
 }
 
@@ -94,23 +93,43 @@ EASING_FUNCTIONS: dict[str, EasingFunction] = {
     b + s.__name__: easing((b, fn), s) for s in _EASING_SUFFIXES for b, fn in _EASING_BASIC_FUNCTIONS.items()
 }
 
+# Back/Elastic 的 InOut 不是简单拼接两段 In/Out。
+EASING_FUNCTIONS['back_inout'] = lambda t: (
+    (2 * t) ** 2 * (3.5949095 * 2 * t - 2.5949095) / 2
+    if t < 0.5
+    else ((2 * t - 2) ** 2 * (3.5949095 * (2 * t - 2) + 2.5949095) + 2) / 2
+)
+EASING_FUNCTIONS['elastic_inout'] = lambda t: (
+    t
+    if t == 0 or t == 1
+    else (
+        -(2 ** (20 * t - 10) * sin((20 * t - 11.125) * (2 * pi / 4.5))) / 2
+        if t < 0.5
+        else 2 ** (-20 * t + 10) * sin((20 * t - 11.125) * (2 * pi / 4.5)) / 2 + 1
+    )
+)
+
+LINEAR: EasingFunction = EASING_FUNCTIONS['linear_in']
 LVALUE: EasingFunction = lambda _: 0
 RVALUE: EasingFunction = lambda _: 1
 
 
 def easing_with_range(f: EasingFunction, left: float, right: float) -> EasingFunction:
+    left, right = max(0.0, min(1.0, left)), max(0.0, min(1.0, right))
+    if left >= right:
+        return f
     fl = f(left)
     fr = f(right)
     d = fr - fl
+    if isclose(d, 0, abs_tol=1e-12):
+        return LINEAR
     return lambda t: (f(left + (right - left) * t) - fl) / d
 
 
 _BEZIER_SAMPLES_COUNT = 21
 _BEZIER_SAMPLE_STEP = 1 / (_BEZIER_SAMPLES_COUNT - 1)
-_NEWTON_MIN_STEP = 1e-3
-_NEWTON_STOP = 4
-_SUBDIVISION_PREC = 1e-7
-_SUBDIVISION_STOP = 10
+_BEZIER_PARAMETER_PREC = 1e-12
+_BEZIER_ITERATIONS = 48
 _SLOPE_EPS = 1e-7
 
 
@@ -124,49 +143,44 @@ def cubic_rev_bezier(x1: float, y1: float, x2: float, y2: float) -> EasingFuncti
     ]
 
     def inner(t: float) -> float:
-        if t == 0 or t == 1:
-            return ((a1 * t + a2) * t + a3) * t
-        i = min(int(t / _BEZIER_SAMPLE_STEP), _BEZIER_SAMPLES_COUNT - 1)
-        dist = (t - sample_table[i]) / (sample_table[i + 1] - sample_table[i])
-        tt = (i + dist) * _BEZIER_SAMPLE_STEP
-        slp = (b1 * 3 * tt + b2 * 2) * tt + b3
-        if slp <= _SLOPE_EPS:
-            pass
-        elif slp >= _NEWTON_MIN_STEP:
-            # newton iteration
-            for _ in range(_NEWTON_STOP):
-                diff = ((b1 * tt + b2) * tt + b3) * tt - t
-                tt -= diff / slp
-                slp = (b1 * 3 * tt + b2 * 2) * tt + b3
-                if slp <= _SLOPE_EPS:
-                    break
-        else:
-            # bisect
-            l, r = _BEZIER_SAMPLE_STEP * i, _BEZIER_SAMPLE_STEP * (i + 1)
-            tt = (l + r) / 2
-            for _ in range(_SUBDIVISION_STOP):
-                diff = ((b1 * tt + b2) * tt + b3) * tt - t
-                if abs(diff) <= _SUBDIVISION_PREC:
-                    break
-                if diff > 0:
-                    r = tt
-                else:
-                    l = tt
-                tt = (l + r) / 2
+        if t <= 0 or t >= 1:
+            return max(0.0, min(1.0, t))
+        # 这里找的是 x(t) 的采样区间而不是参数 t 的等距区间
+        i = max(0, min(bisect.bisect_right(sample_table, t) - 1, _BEZIER_SAMPLES_COUNT - 2))
+        left, right = i * _BEZIER_SAMPLE_STEP, (i + 1) * _BEZIER_SAMPLE_STEP
+        span = sample_table[i + 1] - sample_table[i]
+        dist = (t - sample_table[i]) / span if span else 0.0
+        tt = left + dist * _BEZIER_SAMPLE_STEP
+        for _ in range(_BEZIER_ITERATIONS):
+            diff = ((b1 * tt + b2) * tt + b3) * tt - t
+            if diff == 0:
+                break
+            if diff > 0:
+                right = tt
+            else:
+                left = tt
+            slope = (b1 * 3 * tt + b2 * 2) * tt + b3
+            next_tt = tt - diff / slope if slope >= _SLOPE_EPS else (left + right) / 2
+            if not left < next_tt < right:
+                next_tt = (left + right) / 2
+            if abs(next_tt - tt) <= _BEZIER_PARAMETER_PREC:
+                tt = next_tt
+                break
+            tt = next_tt
         return ((a1 * tt + a2) * tt + a3) * tt
 
     return inner
 
 
 class Easing3D(Enum):
-    Linear = partial(_easing_linear)
-    CubicBezier = partial(_easing_cubic_bezier)
-    Si = partial(_easing_sinus, x='si')
-    SiSi = partial(_easing_sinus, x='si', z='si')
-    SiSo = partial(_easing_sinus, x='si', z='so')
-    So = partial(_easing_sinus, x='so')
-    SoSo = partial(_easing_sinus, x='so', z='so')
-    SoSi = partial(_easing_sinus, x='so', z='si')
+    Linear = member(partial(_easing_linear))
+    CubicBezier = member(partial(_easing_cubic_bezier))
+    Si = member(partial(_easing_sinus, x='si'))
+    SiSi = member(partial(_easing_sinus, x='si', z='si'))
+    SiSo = member(partial(_easing_sinus, x='si', z='so'))
+    So = member(partial(_easing_sinus, x='so'))
+    SoSo = member(partial(_easing_sinus, x='so', z='so'))
+    SoSi = member(partial(_easing_sinus, x='so', z='si'))
 
 
 if __name__ == '__main__':

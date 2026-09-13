@@ -1,42 +1,43 @@
-from typing import TypedDict, NamedTuple, Callable
+from typing import TypedDict, NamedTuple
 import math
 import cmath
 
-from basis import Note, NoteType, JudgeLine, Chart, Position
-from bamboo import TwinBamboo, LivingBamboo, BambooGrove, Bamboo, BambooShoot, _Interpable
-from easing import EasingFunction, EASING_FUNCTIONS, easing_with_range, cubic_rev_bezier, LVALUE
+from basis import Note, NoteType, JudgeLine, Chart, Position, VisualNote
+from bamboo import TwinBamboo, LivingBamboo, BambooGrove, Bamboo, BambooShoot, BambooFunc, EventBamboo, IntegratedBamboo
+from easing import EasingFunction, EASING_FUNCTIONS, easing_with_range, cubic_rev_bezier, LINEAR, LVALUE
+from timing import TempoMap
 
 RPE_EASING_FUNCS: list[EasingFunction] = [
-    (lambda _: _),  # 0
-    (lambda _: _),  # 1
+    LINEAR,  # 0
+    LINEAR,  # 1
     EASING_FUNCTIONS['sine_out'],  # 2
     EASING_FUNCTIONS['sine_in'],  # 3
-    EASING_FUNCTIONS['quad_in'],  # 4
-    EASING_FUNCTIONS['quad_out'],  # 5
-    EASING_FUNCTIONS['sine_outin'],  # 6
-    EASING_FUNCTIONS['quad_outin'],  # 7
-    EASING_FUNCTIONS['cubic_in'],  # 8
-    EASING_FUNCTIONS['cubic_out'],  # 9
-    EASING_FUNCTIONS['quart_in'],  # 10
-    EASING_FUNCTIONS['quart_out'],  # 11
-    EASING_FUNCTIONS['cubic_outin'],  # 12
-    EASING_FUNCTIONS['quart_outin'],  # 13
-    EASING_FUNCTIONS['quint_in'],  # 14
-    EASING_FUNCTIONS['quint_out'],  # 15
-    EASING_FUNCTIONS['expo_in'],  # 16
-    EASING_FUNCTIONS['expo_out'],  # 17
-    EASING_FUNCTIONS['circ_in'],  # 18
-    EASING_FUNCTIONS['circ_out'],  # 19
-    EASING_FUNCTIONS['back_in'],  # 20
-    EASING_FUNCTIONS['back_out'],  # 21
-    EASING_FUNCTIONS['circ_outin'],  # 22
-    EASING_FUNCTIONS['back_outin'],  # 23
-    EASING_FUNCTIONS['elastic_in'],  # 24
-    EASING_FUNCTIONS['elastic_out'],  # 25
-    EASING_FUNCTIONS['bounce_in'],  # 26
-    EASING_FUNCTIONS['bounce_out'],  # 27
-    EASING_FUNCTIONS['bounce_outin'],  # 28
-    EASING_FUNCTIONS['elastic_outin'],  # 29
+    EASING_FUNCTIONS['quad_out'],  # 4
+    EASING_FUNCTIONS['quad_in'],  # 5
+    EASING_FUNCTIONS['sine_inout'],  # 6
+    EASING_FUNCTIONS['quad_inout'],  # 7
+    EASING_FUNCTIONS['cubic_out'],  # 8
+    EASING_FUNCTIONS['cubic_in'],  # 9
+    EASING_FUNCTIONS['quart_out'],  # 10
+    EASING_FUNCTIONS['quart_in'],  # 11
+    EASING_FUNCTIONS['cubic_inout'],  # 12
+    EASING_FUNCTIONS['quart_inout'],  # 13
+    EASING_FUNCTIONS['quint_out'],  # 14
+    EASING_FUNCTIONS['quint_in'],  # 15
+    EASING_FUNCTIONS['expo_out'],  # 16
+    EASING_FUNCTIONS['expo_in'],  # 17
+    EASING_FUNCTIONS['circ_out'],  # 18
+    EASING_FUNCTIONS['circ_in'],  # 19
+    EASING_FUNCTIONS['back_out'],  # 20
+    EASING_FUNCTIONS['back_in'],  # 21
+    EASING_FUNCTIONS['circ_inout'],  # 22
+    EASING_FUNCTIONS['back_inout'],  # 23
+    EASING_FUNCTIONS['elastic_out'],  # 24
+    EASING_FUNCTIONS['elastic_in'],  # 25
+    EASING_FUNCTIONS['bounce_out'],  # 26
+    EASING_FUNCTIONS['bounce_in'],  # 27
+    EASING_FUNCTIONS['bounce_inout'],  # 28
+    EASING_FUNCTIONS['elastic_inout'],  # 29
 ]
 
 
@@ -46,6 +47,8 @@ class RpeBeats(NamedTuple):
     deno: float
 
     def beats(self) -> float:
+        if self.deno == 0:
+            raise ValueError('RPE beat denominator cannot be zero')
         return self.add + self.num / self.deno
 
 
@@ -92,6 +95,7 @@ class RpeExtendedEventsDict(TypedDict, total=False):
 
 
 RPE_NOTE_TYPES = [NoteType.UNKNOWN, NoteType.TAP, NoteType.HOLD, NoteType.FLICK, NoteType.DRAG]
+
 
 class RpeNoteDict(TypedDict):
     type: int
@@ -145,173 +149,337 @@ class RpeChartDict(TypedDict):
     judgeLineList: list[RpeJudgeLineDict]
 
 
-class RpeBpsInfo(NamedTuple):
-    seconds: float
-    beats: float
-    bps: float
+def beats(value) -> float:
+    result = RpeBeats(*value).beats() if isinstance(value, (list, tuple)) else float(value)
+    if not math.isfinite(result):
+        raise ValueError(f'invalid RPE beat: {value}')
+    return result
+
+
+def get_easing(event: dict) -> EasingFunction:
+    if event.get('bezier', 0):
+        points = event.get('bezierPoints', (0, 0, 1, 1))
+        if len(points) != 4 or not all(math.isfinite(p) for p in points):
+            raise ValueError(f'invalid bezier control points: {points}')
+        x1, y1, x2, y2 = points
+        return cubic_rev_bezier(max(0, min(1, x1)), y1, max(0, min(1, x2)), y2)
+    kind = event.get('easingType', 1)
+    easing = RPE_EASING_FUNCS[kind] if isinstance(kind, int) and 0 <= kind < len(RPE_EASING_FUNCS) else LINEAR
+    left, right = event.get('easingLeft', 0.0), event.get('easingRight', 1.0)
+    return easing if left == 0 and right == 1 else easing_with_range(easing, left, right)
+
+
+def speed_easing(event: dict, version: int) -> EasingFunction:
+    kind = event.get('easingType', 1)
+    if version < 162:
+        return LINEAR
+    if kind == 0:
+        return LVALUE
+    if kind == 1:
+        return LINEAR
+    easing = get_easing(event)
+    if version >= 170:
+        return easing
+
+    # RPE 1.6.2~1.6.9 使用缓动的导函数控制速度，1.7.0 恢复对速度直接缓动
+    def derivative(t):
+        # 在端点内侧取样
+        left, right = max(1e-7, t - 1e-6), min(1 - 1e-7, t + 1e-6)
+        return (easing(right) - easing(left)) / (right - left) if right > left else 0.0
+
+    first, last = derivative(0.0), derivative(1.0)
+    delta = last - first
+    if not math.isfinite(delta) or abs(delta) < 1e-8:
+        return LINEAR
+
+    def result(t):
+        return (derivative(t) - first) / delta
+
+    result.integral = lambda a, b: (easing(b) - easing(a) - first * (b - a)) / delta
+    return result
+
+
+def interpolate_text(start: str, end: str, t: float) -> str:
+    t = max(0.0, min(1.0, t))
+    if '%P%' in start and '%P%' in end:
+        first, last = start.replace('%P%', ''), end.replace('%P%', '')
+        if t == 0:
+            return first
+        if t == 1:
+            return last
+        try:
+            a, b = float(first), float(last)
+        except ValueError:
+            return first
+        value = a + (b - a) * t
+        return f'{value:.0f}' if a.is_integer() and b.is_integer() else f'{value:.3f}'
+    start, end = start.replace('%P%', ''), end.replace('%P%', '')
+    if not start:
+        return end[: math.floor(len(end) * t + 0.5)]
+    if not end:
+        return start[: math.floor(len(start) * (1 - t) + 0.5)]
+    if end.startswith(start):
+        return end[: len(start) + math.floor((len(end) - len(start)) * t)]
+    if start.startswith(end):
+        return start[: len(end) + math.floor((len(start) - len(end)) * (1 - t) + 0.5)]
+    return end if t == 1 else start
 
 
 class RpeJudgeLine(JudgeLine):
     chart: 'RpeChart'
 
-    scale_x: Bamboo[float]
-    scale_y: Bamboo[float]
-    incline: Bamboo[float]
-
-
-    pos_control: LivingBamboo[float]
-    skew_control: LivingBamboo[float]
-    y_control: LivingBamboo[float]
-
     def __init__(self, dic: RpeJudgeLineDict, chart: 'RpeChart') -> None:
         super().__init__()
-
         self.chart = chart
+        self.bpm_factor = float(dic.get('bpmfactor', 1.0))
+        if not math.isfinite(self.bpm_factor) or self.bpm_factor <= 0:
+            raise ValueError(f'invalid bpmfactor: {self.bpm_factor}')
+        self.father: RpeJudgeLine | None = None
+        self.rotate_with_father = bool(dic.get('rotateWithFather', False))
+        self._cached_time = None
+        self._cached_transform = (0j, 0.0)
+        self.control_scale = chart._CHART_HEIGHT / chart.height
+        self.is_cover = dic.get('isCover', 1) == 1
+        self.z_order = dic.get('zOrder', 0)
+        self.texture = dic.get('Texture', 'line.png')
+        self.attach_ui = dic.get('attachUI')
+        self.anchor = tuple(dic.get('anchor', (0.5, 0.5)))
+        if self.texture != 'line.png':
+            self.color = BambooShoot((255, 255, 255))
+        if self.attach_ui is not None:
+            chart.warn('attachUI lines are not displayed in the simplified preview.')
 
-        # control events
-        self.pos_control = LivingBamboo[float]()
-        if 'posControl' in dic:
-            for event in dic['posControl']:
-                self.pos_control.cut(event['x'], event['pos'], RPE_EASING_FUNCS[event['easing']])
-        self.skew_control = LivingBamboo[float]()
-        if 'skewControl' in dic:
-            for event in dic['skewControl']:
-                self.skew_control.cut(event['x'], event['skew'], RPE_EASING_FUNCS[event['easing']])
-        self.y_control = LivingBamboo[float]()
-        if 'yControl' in dic:
-            for event in dic['yControl']:
-                self.y_control.cut(event['x'], event['y'], RPE_EASING_FUNCS[event['easing']])
+        def control(name: str, key: str, default: float) -> Bamboo[float]:
+            points = sorted(dic.get(name) or [], key=lambda e: e['x'])
+            if not points:
+                return BambooShoot(default)
+            result = LivingBamboo[float]()
+            for i, point in enumerate(points):
+                # Control 的 easing 属于抵达该控制点的区间，和普通事件不同
+                kind = points[min(i + 1, len(points) - 1)].get('easing', 1)
+                result.cut(point['x'], point.get(key, default), get_easing({'easingType': kind}))
+            return result
 
-        def get_easing(event: RpeEventDict) -> EasingFunction:
-            if 'bezier' in event and event['bezier'] != 0:
-                return cubic_rev_bezier(*event['bezierPoints'])
-            else:
-                # not bezier
-                easing_type = event['easingType']
-                easing_func: EasingFunction
-                if easing_type > len(RPE_EASING_FUNCS) - 1:
-                    print(f'unsupported easing type: {easing_type}')
-                    easing_func = LVALUE
-                else:
-                    easing_func = RPE_EASING_FUNCS[event['easingType']]
+        self.pos_control = control('posControl', 'pos', 1.0)
+        self.y_control = control('yControl', 'y', 1.0)
+        self.alpha_control = control('alphaControl', 'alpha', 1.0)
+        self.size_control = control('sizeControl', 'size', 1.0)
+        self.skew_control = control('skewControl', 'skew', 0.0)
+        if any(point.get('skew', 0) for point in dic.get('skewControl') or []):
+            chart.warn('skewControl is preserved but not rendered; Phira does not define its behavior.')
 
-                if math.isclose(event['easingLeft'], 0) and math.isclose(event['easingRight'], 1):
-                    return easing_func
-                else:
-                    return easing_with_range(easing_func, event['easingLeft'], event['easingRight'])
-        
-        def convert_events(events: list[RpeEventDict], convert: Callable[[float], float] | None = None) -> Bamboo[float]:
-            b = LivingBamboo[float]()
-            if not convert:
-                for event in events:
-                    b.cut(self.chart._beats_to_seconds(RpeBeats(*event['startTime']).beats()), event['start'], get_easing(event))
-                    b.cut(self.chart._beats_to_seconds(RpeBeats(*event['endTime']).beats()), event['end'], LVALUE)
-            else:
-                for event in events:
-                    b.cut(self.chart._beats_to_seconds(RpeBeats(*event['startTime']).beats()), convert(event['start']), get_easing(event))
-                    b.cut(self.chart._beats_to_seconds(RpeBeats(*event['endTime']).beats()), convert(event['end']), LVALUE)
-            return b
-
-        xss: list[Bamboo[float]] = []
-        yss: list[Bamboo[float]] = []
-        alphas: list[Bamboo[float]] = []
-        for layers in dic['eventLayers']:
-            if not isinstance(layers, dict):
+        xs, ys, rotations, opacities, speeds, floors = [], [], [], [], [], []
+        for layer in dic.get('eventLayers') or []:
+            if not isinstance(layer, dict):
                 continue
-            if 'moveXEvents' in layers:
-                xss.append(convert_events(layers['moveXEvents'], lambda x: x / chart._CHART_WIDTH * chart.width))
-            if 'moveYEvents' in layers:
-                yss.append(convert_events(layers['moveYEvents'], lambda y: -y / chart._CHART_HEIGHT * chart.height))
-            if 'rotateEvents' in layers:
-                alphas.append(convert_events(layers['rotateEvents'], math.radians))
-        self.position = TwinBamboo(BambooGrove(xss, 0), BambooGrove(yss, 0), lambda pos: pos + complex(self.chart.width, self.chart.height) / 2)
-        self.angle = BambooGrove(alphas, 0)
+            if layer.get('moveXEvents'):
+                xs.append(
+                    self.convert_events(layer['moveXEvents'], convert=lambda x: x / chart._CHART_WIDTH * chart.width)
+                )
+            if layer.get('moveYEvents'):
+                ys.append(
+                    self.convert_events(layer['moveYEvents'], convert=lambda y: -y / chart._CHART_HEIGHT * chart.height)
+                )
+            if layer.get('rotateEvents'):
+                rotations.append(self.convert_events(layer['rotateEvents'], convert=math.radians))
+            if layer.get('alphaEvents'):
+                opacities.append(self.convert_events(layer['alphaEvents'], convert=lambda a: a / 255))
+            if layer.get('speedEvents'):
+                speed = self.convert_events(
+                    layer['speedEvents'], convert=lambda v: v * chart.height / (9 * 0.83175), is_speed=True
+                )
+                speeds.append(speed)
+                floors.append(IntegratedBamboo(speed))
+        self.local_position = TwinBamboo(BambooGrove(xs, 0.0), BambooGrove(ys, 0.0))
+        self.local_angle = BambooGrove(rotations, 0.0)
+        self.position = BambooFunc(lambda t: self.transform(t)[0])
+        self.angle = BambooFunc(lambda t: self.transform(t)[1])
+        self.opacity = BambooGrove(opacities, 0.0) if opacities else BambooShoot(1.0)
+        self.speed = BambooGrove(speeds, 0.0)
+        self.floor = BambooGrove(floors, 0.0)
 
-        extended_dict = dic['extended']
+        extended = dic.get('extended') or {}
+        for name in ('paintEvents', 'gifEvents'):
+            if extended.get(name):
+                chart.warn(f'{name} is not rendered in the simplified preview.')
+        if dic.get('isGif'):
+            chart.warn('GIF line textures are displayed as still images in the simplified preview.')
+        self.incline = self.convert_events(extended.get('inclineEvents'), convert=math.radians, extend_first=False)
+        self.scale_x = self.convert_events(extended.get('scaleXEvents'), default=1.0, extend_first=False)
+        self.scale_y = self.convert_events(extended.get('scaleYEvents'), default=1.0, extend_first=False)
+        if extended.get('textEvents'):
+            self.text = self.convert_events(
+                extended['textEvents'], default='', interpolate=interpolate_text, extend_first=False
+            )
+            self.color = BambooShoot((255, 255, 255))
+        if extended.get('colorEvents'):
+            self.color = self.convert_events(
+                extended['colorEvents'],
+                default=(255, 255, 255),
+                convert=tuple,
+                interpolate=lambda a, b, t: tuple(x + (y - x) * t for x, y in zip(a, b)),
+                extend_first=False,
+            )
 
-        self.incline = convert_events(extended_dict['inclineEvents']) if 'inclineEvents' in extended_dict else BambooShoot(0)
-        self.scale_x = convert_events(extended_dict['scaleXEvents']) if 'scaleXEvents' in extended_dict else BambooShoot(1)
-        self.scale_y = convert_events(extended_dict['scaleYEvents']) if 'scaleYEvents' in extended_dict else BambooShoot(1)
+        for item in dic.get('notes') or []:
+            kind = item.get('type', 1)
+            if not isinstance(kind, int) or not 1 <= kind < len(RPE_NOTE_TYPES):
+                raise ValueError(f'unknown RPE note type: {kind}')
+            start = self.seconds(item['startTime'])
+            end = self.seconds(item.get('endTime', item['startTime'])) if kind == 2 else start
+            if end < start:
+                raise ValueError(f'hold ends before it starts: {start}, {end}')
+            for name in ('positionX', 'yOffset', 'alpha', 'size', 'speed'):
+                if name in item and not math.isfinite(item[name]):
+                    raise ValueError(f'invalid note {name}: {item[name]}')
+            visible_time = item.get('visibleTime', math.inf)
+            # 负 visibleTime 表示判定时间之后才显示
+            if math.isnan(visible_time):
+                raise ValueError(f'invalid note visibleTime: {visible_time}')
+            tint = tuple(item.get('tint') or item.get('color') or (255, 255, 255))
+            if len(tint) != 3 or not all(math.isfinite(v) for v in tint):
+                raise ValueError(f'invalid note tint: {tint}')
+            if item.get('judgeArea', 1) not in (None, 1):
+                chart.warn('Custom judgeArea is not applied by the touch planners.')
+            x = item.get('positionX', 0.0) / chart._CHART_WIDTH * chart.width
+            note = Note(RPE_NOTE_TYPES[kind], start, end - start, complex(x))
+            visual = VisualNote(
+                note,
+                position_x=x,
+                y_offset=item.get('yOffset', 0.0) / chart._CHART_HEIGHT * chart.height,
+                speed=item.get('speed', 1.0),
+                above=item.get('above', 1) == 1,
+                alpha=item.get('alpha', 255) / 255,
+                size=item.get('size', 1.0),
+                is_fake=bool(item.get('isFake', 0)),
+                visible_time=visible_time,
+                floor=self.floor @ start,
+                end_floor=self.floor @ end,
+                tint=tint,
+            )
+            # Control 和 incline 只有外观变了
+            side = -1 if visual.above else 1
+            visual.note = note._replace(offset=complex(x, visual.y_offset * visual.speed * side))
+            self.visual_notes.append(visual)
+            if not visual.is_fake:
+                self.notes.append(visual.note)
+        self.notes.sort(key=lambda n: n.seconds)
+        self.visual_notes.sort(key=lambda n: n.note.seconds)
 
-        self.notes = []
-        for note in dic['notes']:
-            if note['isFake']:
-                continue
-            note_type = RPE_NOTE_TYPES[note['type']]
-            start_time = self.chart._beats_to_seconds(RpeBeats(*note['startTime']).beats())
-            end_time = self.chart._beats_to_seconds(RpeBeats(*note['endTime']).beats())
-            self.notes.append(Note(note_type, start_time, end_time - start_time, complex(note['positionX'] / chart._CHART_WIDTH * chart.width, note['yOffset'] / chart._CHART_HEIGHT * chart.height * note['speed'])))
-    
+    def convert_events(
+        self, events, default=0.0, convert=None, interpolate=None, extend_first=True, is_speed=False
+    ) -> EventBamboo:
+        convert = convert or (lambda v: v)
+        result = EventBamboo(default, interpolate)
+        cursor = -math.inf
+        overlaps = 0
+        for event in sorted(events or [], key=lambda e: beats(e['startTime'])):
+            start, end = self.seconds(event['startTime']), self.seconds(event['endTime'])
+            if end < start:
+                raise ValueError(f'event ends before it starts: {start}, {end}')
+            a, b = convert(event.get('start', default)), convert(event.get('end', default))
+            if is_speed:
+                if start < cursor:
+                    overlaps += 1
+                start, end = max(start, cursor), max(end, cursor)
+                cursor = end
+            if a == b or start == end:
+                easing = LINEAR
+            else:
+                easing = speed_easing(event, self.chart.version) if is_speed else get_easing(event)
+                kind = event.get('easingType', 1)
+                if not event.get('bezier') and (not isinstance(kind, int) or not 0 <= kind < len(RPE_EASING_FUNCS)):
+                    self.chart.warn(f'Unknown RPE easingType {kind}; using linear interpolation.')
+            result.cut(start, end, a, b, easing)
+        if overlaps:
+            self.chart.warn(f'Clipped {overlaps} overlapping RPE speed events in an event layer.')
+        if extend_first and not is_speed and result.events:
+            result.default = result.events[0].start_value
+        return result
+
+    def seconds(self, value) -> float:
+        return self.chart._beats_to_seconds(beats(value)) * self.bpm_factor
+
+    def transform(self, seconds: float) -> tuple[Position, float]:
+        if self._cached_time == seconds:
+            return self._cached_transform
+        pending = []
+        line = self
+        while line is not None and line._cached_time != seconds:
+            pending.append(line)
+            line = line.father
+        for line in reversed(pending):
+            position = line.local_position @ seconds
+            angle = line.local_angle @ seconds
+            if line.father is None:
+                position += complex(self.chart.width, self.chart.height) / 2
+            else:
+                parent_pos, parent_angle = line.father._cached_transform
+                position = parent_pos + cmath.exp(parent_angle * 1j) * position
+                if line.rotate_with_father:
+                    angle += parent_angle
+            line._cached_time = seconds
+            line._cached_transform = position, angle
+        return self._cached_transform
+
     def pos(self, seconds: float, offset: Position) -> Position:
-        angle = self.angle @ seconds
-        pos = self.position @ seconds
-        return pos + cmath.exp(angle * 1j) * offset
+        position, angle = self.transform(seconds)
+        return position + cmath.exp(angle * 1j) * offset
 
     def beat_duration(self, seconds: float) -> float:
-        for time_start, _, bps in reversed(self.chart.bpss):
-            if time_start <= seconds:
-                return 1 / bps
-        return 1.875 / 175
+        return self.chart.tempo.beat_duration(seconds / self.bpm_factor) * self.bpm_factor
 
 
 class RpeChart(Chart):
-    bpss: list[RpeBpsInfo]
     _CHART_WIDTH = 1350
     _CHART_HEIGHT = 900
 
     def __init__(self, dic: RpeChartDict, ratio: tuple[int, int]) -> None:
         super().__init__()
         self.width, self.height = ratio
-
-        self.bpss = []
-        for item in dic['BPMList']:
-            bps = item['bpm'] / 60
-            beats = RpeBeats(*item['startTime']).beats()
-            if not self.bpss:
-                self.bpss.append(RpeBpsInfo(0, beats, bps))
-                continue
-            seconds_passed, beats_passed, last_bps = self.bpss[-1]
-            seconds_passed += (beats - beats_passed) / last_bps
-            self.bpss.append(RpeBpsInfo(seconds_passed, beats, bps))
-        
+        self.format = 'rpe'
+        meta = dic.get('META') or {}
+        self.offset = float(meta.get('offset', 0)) / 1000
+        if not math.isfinite(self.offset):
+            raise ValueError(f'invalid RPE offset: {self.offset}')
+        version = meta.get('RPEVersion')
+        try:
+            self.version = 160 if version is None else int(version)
+        except (ValueError, TypeError, OverflowError):
+            self.version = 160
+            self.warn(f'Invalid RPEVersion {version!r}; using legacy version 160.')
+        self.tempo = TempoMap((beats(item['startTime']), item['bpm']) for item in dic['BPMList'])
+        self.bpss = self.tempo.events
         self.lines = []
-        for line in dic['judgeLineList']:
-            if 'notes' not in line:
+        for index, line in enumerate(dic['judgeLineList']):
+            try:
+                self.lines.append(RpeJudgeLine(line, self))
+            except (ValueError, TypeError, KeyError, IndexError, OverflowError) as error:
+                raise ValueError(f'RPE line {index}: {error}') from error
+        for index, (line, item) in enumerate(zip(self.lines, dic['judgeLineList'])):
+            parent = item.get('father', -1)
+            if parent is None or parent == -1:
                 continue
-            self.lines.append(RpeJudgeLine(line, self))
+            if not isinstance(parent, int) or not 0 <= parent < len(self.lines):
+                raise ValueError(f'invalid parent {parent} on RPE line {index}')
+            line.father = self.lines[parent]
+        # 空线得保留，不然父线索引就坏了
+        visited = set()
+        for index, line in enumerate(self.lines):
+            chain = set()
+            while line is not None and line not in visited:
+                if line in chain:
+                    raise ValueError(f'cyclic RPE parent relation at line {index}')
+                chain.add(line)
+                line = line.father
+            visited.update(chain)
+
+    def warn(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
 
     def _beats_to_seconds(self, beats: float) -> float:
-        # 跟pec.py的函数完全一样
-        for seconds, beats_begin, bps in reversed(self.bpss):
-            if beats >= beats_begin:
-                return seconds + (beats - beats_begin) / bps
-        raise RuntimeError('???')
+        return self.tempo.seconds(beats)
 
-if __name__ == '__main__':
-    # tests
-    import json
-    rpe = RpeChart(json.load(open('../../test/phira/1000/AT15.json')), (16, 9))
-    import pygame
 
-    pygame.init()
-    screen = pygame.display.set_mode((1350, 900))
-    clock = pygame.time.Clock()
-    running = True
-
-    seconds = 0
-
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-        screen.fill('black')
-        pos = rpe.lines[0].position @ seconds
-        angle = cmath.exp(rpe.lines[0].angle @ seconds * 1j)
-        left = pos + angle * 3500
-        right = pos - angle * 3500
-        pygame.draw.circle(screen, 'white', (pos.real, pos.imag), 10)
-        pygame.draw.line(screen, 'white', (left.real, left.imag), (right.real, right.imag), 4)
-        pygame.display.flip()
-        seconds += clock.tick(60) / 1000
-    pygame.quit()
+__all__ = ['RpeChart']
