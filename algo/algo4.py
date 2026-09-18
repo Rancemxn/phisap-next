@@ -17,10 +17,9 @@ from shapely import (
     distance,
     centroid,
     difference,
-    get_parts
+    union_all,
 )
 from shapely.ops import nearest_points
-from shapely.affinity import rotate
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
@@ -66,16 +65,35 @@ class SemiNote(NamedTuple):
     id: NoteID
     rotation: Vector
 
-class JudgeArea:
-    __slots__ = ('center', 'rotation', 'poly', 'w_judge')
+# 判定带半宽
+# 规划时取最窄的一档再乘余量，规避别的note时取最宽的一档再放大
+JUDGE_HALF_TAP = 0.106875
+JUDGE_HALF_DRAG = 0.118125
+JUDGE_MARGIN = 0.85
+JUDGE_EXCLUDE = 1.15
+# 指针要停够这么久才能够使用
+DOWN_SETTLE = 50
+DOWN_LATENCY = 34
+# 同一时刻落在同一条判定带里的几个Flick，后面的滑动依次往后错开这么久，最多错开 FLICK_STAGGER_MAX
+# 解决下Flick海的问题
+FLICK_STAGGER = 30
+FLICK_STAGGER_MAX = 60
+# 滑动轨迹允许偏离自己判定中线的比例
+FLICK_LATERAL = 0.5
 
-    def __init__(self, center: Position, rotation: Vector, screen_w: float, screen_h: float) -> None:
+class JudgeArea:
+    __slots__ = ('center', 'rotation', 'poly', 'half_width')
+
+    def __init__(
+        self, center: Position, rotation: Vector, screen_w: float, screen_h: float,
+        half: float = JUDGE_HALF_TAP, scale: float = JUDGE_MARGIN
+    ) -> None:
         self.center = center
         self.rotation = rotation
-        self.w_judge = screen_w * 0.118125
+        self.half_width = screen_w * half * scale
         perp = rotation * 1j
-        limit = math.hypot(screen_w, screen_h)
-        d_rot = rotation * (self.w_judge / 2)
+        limit = math.hypot(screen_w, screen_h) + abs(center)
+        d_rot = rotation * self.half_width
         d_perp = perp * limit
         c1 = center + d_rot + d_perp
         c2 = center + d_rot - d_perp
@@ -98,19 +116,7 @@ class JudgeArea:
     def is_valid_zone(self, valid_poly: Polygon, screen_w: float) -> bool:
         if valid_poly.is_empty:
             return False
-        min_dim = self.w_judge * 0.8
-        geoms = get_parts(valid_poly)
-        angle_deg = -math.degrees(cmath.phase(self.rotation))
-        for geom in geoms:
-            if geom.is_empty:
-                continue
-            rotated = rotate(geom, angle_deg, origin=(self.center.real, self.center.imag))
-            minx, miny, maxx, maxy = rotated.bounds
-            w = maxx - minx
-            h = maxy - miny
-            if w >= min_dim and h >= min_dim:
-                return True
-        return False
+        return valid_poly.area > (screen_w * 1e-4) ** 2
 
 class PointerRecord(NamedTuple):
     id: PointerID
@@ -121,13 +127,14 @@ class PointerRecord(NamedTuple):
     note_type: SemiNoteType | None = None
 
 class PointerManager:
-    __slots__ = ('occupied', 'idle', 'unused', 'last_active_ts', 'waiting_liftup', 'current_ts', 'console', 'noway')
+    __slots__ = ('occupied', 'idle', 'unused', 'last_active_ts', 'down_ts', 'waiting_liftup', 'current_ts', 'console', 'noway')
 
     def __init__(self, pointer_ids: Iterable[PointerID], console: Console, noway: bool = False) -> None:
         self.occupied: dict[NoteID, PointerRecord] = {}
         self.idle: set[PointerID] = set(pointer_ids)
         self.unused: dict[PointerID, PointerRecord] = {}
         self.last_active_ts: dict[PointerID, int] = {pid: 0 for pid in pointer_ids}
+        self.down_ts: dict[PointerID, int] = {}
         self.waiting_liftup: list[tuple[PointerRecord, int]] = []
         self.current_ts: int = 0
         self.console: Console = console
@@ -145,7 +152,7 @@ class PointerManager:
         if not new and self.unused:
             valid_unused = {
                 pid: ptr for pid, ptr in self.unused.items()
-                if ptr.timestamp < self.current_ts
+                if ptr.timestamp < self.current_ts and not self.settling(pid)
             }
             if valid_unused:
                 ptr = min(valid_unused.values(), key=lambda p: abs(note.position - p.position))
@@ -157,9 +164,15 @@ class PointerManager:
             pid = self.idle.pop()
             self.occupied[nid] = PointerRecord(pid, note.position, self.current_ts, line_ref, note_offset, note.type)
             self.last_active_ts[pid] = self.current_ts
+            self.down_ts[pid] = self.current_ts
             return pid, True
         if self.unused:
-            ptr = min(self.unused.values(), key=lambda p: abs(note.position - p.position))
+            # 优先抬起闲置够久的指针
+            settled = [
+                p for p in self.unused.values()
+                if min(self.current_ts - self.down_ts.get(p.id, 0), self.current_ts - p.timestamp) >= 2 * DOWN_SETTLE
+            ]
+            ptr = min(settled or self.unused.values(), key=lambda p: abs(note.position - p.position))
             if self.current_ts > ptr.timestamp + 1:
                 up_ts = (ptr.timestamp + self.current_ts) // 2
             else:
@@ -173,12 +186,16 @@ class PointerManager:
             self.waiting_liftup.append((ptr, up_ts))
             self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
             self.last_active_ts[ptr.id] = self.current_ts
+            self.down_ts[ptr.id] = self.current_ts
             return ptr.id, True
         
         if self.noway:
             self.console.print(f"[red]Note({note}) @ {self.current_ts} 规划失败[/red]")
             return None, False
         raise RuntimeError(f'no free pointers @ {self.current_ts}')
+
+    def settling(self, pid: PointerID) -> bool:
+        return self.current_ts - self.down_ts.get(pid, -DOWN_SETTLE) < DOWN_SETTLE
 
     def free(self, note: SemiNote) -> None:
         if note.id in self.occupied:
@@ -204,7 +221,7 @@ class PointerManager:
         # pointers.current_ts 是整个谱面的最后一帧的时间戳
         # 不能使用pointer最后活跃的时间，否则谱面末尾如果是Hold就提前松手了，比如李斯特IN
         for ptr in itertools.chain(self.unused.values(), self.occupied.values()):
-            yield ptr, self.current_ts + 10
+            yield ptr, self.current_ts + 100
 
 class SweepTarget:
     __slots__ = ('note', 'poly', 'is_swept')
@@ -229,12 +246,55 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         (screen.width - padding_x, screen.height - padding_y), 
         (padding_x, screen.height - padding_y)
     ])
-    pause_poly = Polygon([
-        (screen.width * 0.85, 0),
-        (screen.width * 0.95, 0),
-        (screen.width * 0.95, screen.height * 0.10),
-        (screen.width * 0.85, screen.height * 0.10)
+    # 扣掉暂停键
+    pause_w = screen.width * 0.10
+    pause_h = screen.height * 0.10
+    pause_poly = MultiPolygon([
+        Polygon([(0, 0), (pause_w, 0), (pause_w, pause_h), (0, pause_h)]),
+        Polygon([
+            (screen.width - pause_w, 0),
+            (screen.width, 0),
+            (screen.width, pause_h),
+            (screen.width - pause_w, pause_h)
+        ]),
     ])
+    hold_keep = screen.width * JUDGE_HALF_TAP * JUDGE_MARGIN * 0.7
+    zone_cache: dict[tuple, Polygon] = {}
+
+    def judge_zone(pos: Position, rot: Vector, half: float = JUDGE_HALF_TAP, scale: float = JUDGE_MARGIN) -> Polygon:
+        # 判定线不动时同一个 note 的判定区会被反复计算，这里缓存一下
+        key = (round(pos.real, 6), round(pos.imag, 6), round(rot.real, 6), round(rot.imag, 6), half, scale)
+        poly = zone_cache.get(key)
+        if poly is None:
+            poly = JudgeArea(pos, rot, screen.width, screen.height, half, scale).get_valid_poly(screen_poly, pause_poly)
+            zone_cache[key] = poly
+        return poly
+
+    def zone_ok(poly: Polygon) -> bool:
+        return not poly.is_empty and poly.area > (screen.width * 1e-4) ** 2
+
+    down_zone_cache: dict[tuple, tuple[Polygon, Polygon]] = {}
+
+    def down_zone(
+        line_obj, t: float, offset: Position, window: int = DOWN_LATENCY,
+        half: float = JUDGE_HALF_TAP, scale: float = JUDGE_MARGIN
+    ) -> tuple[Polygon, Polygon]:
+        # DOWN落点都要在判定带里，就取各时刻判定带的交集吧
+        # 返回并集用来规避别的note把这段时间扫过的范围都排除掉
+        offset = complex(offset)
+        key = (id(line_obj), round(t, 4), round(offset.real, 4), round(offset.imag, 4), window, half, scale)
+        zones = down_zone_cache.get(key)
+        if zones is None:
+            inter = union = None
+            for k in range(4):
+                t_i = t + window * k / 3 / 1000.0
+                rot_i = cmath.exp((line_obj.angle @ t_i) * 1j)
+                poly_i = judge_zone(line_obj.position @ t_i + rot_i * offset, rot_i, half, scale)
+                inter = poly_i if inter is None else intersection(inter, poly_i)
+                union = poly_i if union is None else union.union(poly_i)
+            zones = (inter, union)
+            down_zone_cache[key] = zones
+        return zones
     hold_ranges: list[tuple[int, int, int]] = []
     flick_ranges: list[tuple[int, int]] = []
     max_concurrent_holds = 0
@@ -245,10 +305,24 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     sweep_registry: defaultdict[int, list[SweepTarget]] = defaultdict(list)
     deferred_flicks: list[dict] = []
 
-    def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj) -> tuple[float, Position, Vector, float, bool]:
-        area_obj = JudgeArea(base_pos, base_rot, screen.width, screen.height)
-        valid_touch_zone = area_obj.get_valid_poly(screen_poly, pause_poly)
-        if area_obj.is_valid_zone(valid_touch_zone, screen.width):
+    def pick_point(poly: Polygon, near: Position) -> Position:
+        pt = Point(near.real, near.imag)
+        if poly.contains(pt):
+            return near
+        inner = poly.buffer(-screen.width * 0.01)
+        if not zone_ok(inner):
+            inner = poly
+        geom = nearest_points(inner, pt)[0]
+        return Position(geom.x, geom.y)
+
+    def down_window(note_type: NoteType | SemiNoteType) -> int:
+        if note_type in (NoteType.HOLD, SemiNoteType.HOLD_START):
+            return DOWN_SETTLE
+        return DOWN_LATENCY
+
+    def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj, window: int = DOWN_LATENCY) -> tuple[float, Position, Vector, float, bool]:
+        valid_touch_zone, _ = down_zone(line_obj, base_sec, note_offset, window)
+        if zone_ok(valid_touch_zone):
             orig_point = Point(base_pos.real, base_pos.imag)
             closest_geom = nearest_points(valid_touch_zone, orig_point)[0]
             closest_pos = Position(closest_geom.x, closest_geom.y)
@@ -267,9 +341,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 new_alpha = line_obj.angle @ new_time
                 new_rot = cmath.exp(new_alpha * 1j)
                 new_note_pos = new_lp + new_rot * note_offset
-                new_area_obj = JudgeArea(new_note_pos, new_rot, screen.width, screen.height)
-                new_valid_zone = new_area_obj.get_valid_poly(screen_poly, pause_poly)
-                if new_area_obj.is_valid_zone(new_valid_zone, screen.width):
+                new_valid_zone, _ = down_zone(line_obj, new_time, note_offset, window)
+                if zone_ok(new_valid_zone):
                     orig_point_at_t = Point(new_note_pos.real, new_note_pos.imag)
                     closest_geom = nearest_points(new_valid_zone, orig_point_at_t)[0]
                     closest_pos = Position(closest_geom.x, closest_geom.y)
@@ -281,9 +354,21 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         console.print(f"[red]判定微调失败：note @ {base_sec} of (pos={base_pos},rot={base_rot})[/red]")
         return base_sec, base_pos, base_rot, note_offset, False
 
-    def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, start_off: int) -> Position:
+    def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, start_off: int, shift: float = 0.0) -> Position:
         rate = 1 - 2 * (offset_ms - start_off) / flick_duration
-        return pos + rot * f_dir * screen.flick_radius * rate
+        return pos + rot * f_dir * (screen.flick_radius * rate + shift)
+
+    def fit_flick(pos: Position, rot: Vector, f_dir: Vector, band: Polygon) -> float | None:
+        # 轨迹在屏幕外时，沿滑动方向整体平移下，平移量越小越好
+        for step in range(0, 16):
+            for sign in ((1,) if step == 0 else (-1, 1)):
+                shift = sign * step * screen.flick_radius * 0.1
+                if all(
+                    band.intersects(Point(p.real, p.imag))
+                    for p in (flick_pos(pos, off, rot, f_dir, flick_start, shift) for off in flick_eval_offsets)
+                ):
+                    return shift
+        return None
     
     frames: defaultdict[int, list[SemiNote]] = defaultdict(list)
     dense_frame_sizes: defaultdict[int, int] = defaultdict(int)
@@ -311,7 +396,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 line_pos = line.position @ note.seconds
                 note_pos = line_pos + rotation * note.offset
                 adj_time, adj_pos, adj_rot, adj_offset, adjusted = find_visible_pos(
-                    note.seconds, note_pos, rotation, note.offset, line
+                    note.seconds, note_pos, rotation, note.offset, line, down_window(note.type)
                 )
                 ts = round(adj_time * 1000)
                 note_id_to_line[current_note_id] = line
@@ -321,8 +406,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         frames[ts].append(SemiNote(SemiNoteType.TAP, adj_pos, current_note_id, adj_rot))
                         dense_frame_sizes[ts] += 1
                     case NoteType.DRAG:
-                        area = JudgeArea(adj_pos, adj_rot, screen.width, screen.height)
-                        poly = area.get_valid_poly(screen_poly, pause_poly)
+                        poly = judge_zone(adj_pos, adj_rot, JUDGE_HALF_DRAG)
                         sn = SemiNote(SemiNoteType.DRAG, adj_pos, current_note_id, adj_rot)
                         sweep_registry[ts].append(SweepTarget(sn, poly))
                     case NoteType.FLICK:
@@ -340,8 +424,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                             ang = line.angle @ t
                             rot_t = cmath.exp(ang * 1j)
                             pos = line.pos(t, adj_offset)
-                            area = JudgeArea(pos, rot_t, screen.width, screen.height)
-                            valid_zone_t = area.get_valid_poly(screen_poly, pause_poly)
+                            valid_zone_t = judge_zone(pos, rot_t)
                             p_touch = pos
                             if not valid_zone_t.is_empty:
                                 orig_point = Point(pos.real, pos.imag)
@@ -352,8 +435,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         rot2 = cmath.exp((line.angle @ t2) * 1j)
                         end_pos = p_touch
                         end_pos_raw = line.pos(t2, adj_offset)
-                        area_end = JudgeArea(end_pos_raw, rot2, screen.width, screen.height)
-                        valid_zone_end = area_end.get_valid_poly(screen_poly, pause_poly)
+                        valid_zone_end = judge_zone(end_pos_raw, rot2)
                         if not valid_zone_end.is_empty:
                             orig_point_end = Point(end_pos_raw.real, end_pos_raw.imag)
                             end_pos = Position(nearest_points(valid_zone_end, orig_point_end)[0].x, nearest_points(valid_zone_end, orig_point_end)[0].y)
@@ -366,9 +448,34 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         total_flicks = len(deferred_flicks)
         task2 = progress.add_task("规划滑动轨迹...", total=total_flicks)
         
+        deferred_flicks.sort(key=lambda f: f['ts'])
+        placed_flicks: list[tuple[int, int, Position, Vector]] = []
         for f_info in deferred_flicks:
             base_ts, base_pos, base_rot = f_info['ts'], f_info['pos'], f_info['rot']
             nid, line = f_info['id'], f_info['line']
+            # 同时的flick依次往后错开
+            orig_ts = base_ts
+            while True:
+                clash = [
+                    ts_p for orig_p, ts_p, pos_p, rot_p in placed_flicks
+                    if abs(orig_p - orig_ts) <= 2 and abs(ts_p - base_ts) < FLICK_STAGGER and (
+                        judge_zone(pos_p, rot_p, JUDGE_HALF_DRAG, JUDGE_EXCLUDE).intersects(Point(base_pos.real, base_pos.imag))
+                        or judge_zone(base_pos, base_rot, JUDGE_HALF_DRAG, JUDGE_EXCLUDE).intersects(Point(pos_p.real, pos_p.imag))
+                    )
+                ]
+                if not clash or max(clash) + FLICK_STAGGER - orig_ts > FLICK_STAGGER_MAX:
+                    break
+                base_ts = max(clash) + FLICK_STAGGER
+            if base_ts != orig_ts:
+                t_sec = base_ts / 1000.0
+                alpha = line.angle @ t_sec
+                rot = cmath.exp(alpha * 1j)
+                note_pos = line.position @ t_sec + rot * note_id_to_offset[nid]
+                adj_time, base_pos, base_rot, adj_offset, adjusted = find_visible_pos(t_sec, note_pos, rot, note_id_to_offset[nid], line)
+                base_ts = round(adj_time * 1000)
+                note_id_to_offset[nid] = adj_offset
+                console.print(f"[cyan]错开滑动 @ {orig_ts} => {base_ts} (pos={base_pos})")
+            placed_flicks.append((orig_ts, base_ts, base_pos, base_rot))
             candidates_targets = []
             # 这里整块逻辑都不能追踪flick的偏转，必须以判定时间为准
             # 不然有的绑线flick判定时间后就飞走了，计算出来的flick_pos就不是直线了
@@ -385,34 +492,34 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 if abs(vec) > 0:
                     candidate_dirs.append(vec / abs(vec))
             best_dir = flick_dir
+            best_shift = 0.0
             max_swept = -1
             best_swept_targets = []
+            flick_band = judge_zone(base_pos, base_rot, JUDGE_HALF_DRAG, JUDGE_MARGIN * FLICK_LATERAL)
             for c_dir in candidate_dirs:
-                is_valid = True
+                shift = fit_flick(base_pos, base_rot, c_dir, flick_band)
+                if shift is None:
+                    continue
                 current_swept = []
                 for off in flick_eval_offsets:
                     tick_ts = base_ts + off
-                    p_flick = flick_pos(base_pos, off, base_rot, c_dir, flick_start)
-                    test_area = JudgeArea(p_flick, base_rot, screen.width, screen.height)
-                    test_poly = test_area.get_valid_poly(screen_poly, pause_poly)
-                    if not test_area.is_valid_zone(test_poly, screen.width):
-                        is_valid = False
-                        break
+                    p_flick = flick_pos(base_pos, off, base_rot, c_dir, flick_start, shift)
                     test_point = Point(p_flick.real, p_flick.imag)
                     for target in sweep_registry.get(tick_ts, []):
                         if not target.is_swept and target.poly.intersects(test_point):
                             current_swept.append(target)
-                if is_valid and len(current_swept) > max_swept:
+                if len(current_swept) > max_swept:
                     max_swept = len(current_swept)
                     best_dir = c_dir
+                    best_shift = shift
                     best_swept_targets = current_swept
             if max_swept == -1:
-                best_dir = flick_dir
+                console.print(f"[red]滑动轨迹出屏：note @ {base_ts} (pos={base_pos})[/red]")
             for target in best_swept_targets:
                 target.is_swept = True
             for off in flick_eval_offsets:
                 tick_ts = base_ts + off
-                p_flick = flick_pos(base_pos, off, base_rot, best_dir, flick_start)
+                p_flick = flick_pos(base_pos, off, base_rot, best_dir, flick_start, best_shift)
                 if off == flick_start:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_START, p_flick, nid, base_rot))
                 elif off == flick_end:
@@ -458,14 +565,14 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     line_pos = line.position @ t_sec
                     note_pos = line_pos + rot * orig_offset
                     adj_time, adj_pos, adj_rot, adj_offset, adjusted = find_visible_pos(
-                        t_sec, note_pos, rot, orig_offset, line
+                        t_sec, note_pos, rot, orig_offset, line, down_window(note_to_shift.type)
                     )
                     final_ts = round(adj_time * 1000)
                     shifted_note = SemiNote(note_to_shift.type, adj_pos, nid, adj_rot)
                     frames[final_ts].append(shifted_note)
                     dense_frame_sizes[final_ts] += 1
                     note_id_to_offset[nid] = adj_offset
-                    console.print(f"[cyan]偏移note @ {ts} ({note_to_shift}) => note @ {ts} ({shifted_note})")
+                    console.print(f"[cyan]偏移note @ {ts} ({note_to_shift}) => note @ {final_ts} ({shifted_note})")
                 else:
                     break
             progress.advance(task3, 1)
@@ -507,6 +614,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         task4 = progress.add_task("规划触控事件...", total=total_frames)
 
         result: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
+        pointer_pos: dict[PointerID, Position] = {}
         for timestamp, frame in sorted_frames:
             to_free: list[SemiNote] = []
             must_notes: list[SemiNote] = []
@@ -519,10 +627,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             pointers.current_ts = timestamp
             
             t_sec = timestamp / 1000.0
-            for nid, record in pointers.occupied.items():
-                active_physical_touches[record.id] = record.position
-            for pid, record in pointers.unused.items():
-                active_physical_touches[pid] = record.position
+            for record in itertools.chain(pointers.occupied.values(), pointers.unused.values()):
+                active_physical_touches[record.id] = pointer_pos.get(record.id, record.position)
             
             current_touches = active_physical_touches.copy()
             for note in frame:
@@ -535,58 +641,75 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 elif note.type in (SemiNoteType.HOLD, SemiNoteType.DRAG, SemiNoteType.HOLD_END):
                     passive_notes.append(note)
             
-            active_areas = [
-                JudgeArea(n.position, n.rotation, screen.width, screen.height)
-                for n in must_notes
-            ]
-            active_polys = [
-                area.get_valid_poly(screen_poly, pause_poly)
-                for area in active_areas
-            ]
+            active_polys = []
+            exclude_polys = []
+            for n in must_notes:
+                line_ref = note_id_to_line.get(n.id)
+                offset_val = note_id_to_offset.get(n.id, 0.0)
+                window = down_window(n.type)
+                inter, _ = down_zone(line_ref, t_sec, offset_val, window)
+                if not zone_ok(inter):
+                    inter = judge_zone(n.position, n.rotation)
+                active_polys.append(inter)
+                exclude_polys.append(down_zone(line_ref, t_sec, offset_val, window, JUDGE_HALF_DRAG, JUDGE_EXCLUDE)[1])
             must_targets = [n.position for n in must_notes]
-            max_iters = 5
-            for iter_idx in range(max_iters):
-                changed = False
-                for i in range(len(must_notes)):
-                    for j in range(i + 1, len(must_notes)):
-                        pi = Point(must_targets[i].real, must_targets[i].imag)
-                        pj = Point(must_targets[j].real, must_targets[j].imag)
-                        inter_poly = intersection(active_polys[i], active_polys[j])
-                        if not inter_poly.is_empty:
-                            zone_i = difference(active_polys[i], active_polys[j])
-                            zone_j = difference(active_polys[j], active_polys[i])
-                            is_valid_i = active_areas[i].is_valid_zone(zone_i, screen.width)
-                            is_valid_j = active_areas[j].is_valid_zone(zone_j, screen.width)
-                            if is_valid_i and is_valid_j:
-                                active_polys[i] = zone_i
-                                active_polys[j] = zone_j
-                                # representative_point 确保在判定区域内部
-                                pt_i = zone_i.representative_point()
-                                pt_j = zone_j.representative_point()
-                                must_targets[i] = Position(pt_i.x, pt_i.y)
-                                must_targets[j] = Position(pt_j.x, pt_j.y)
-                                changed = True
-                                console.print(
-                                    f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => note(pos={must_targets[i]}) | note(pos={must_targets[j]})[/yellow]"
-                                )
-                            else:
-                                if not inter_poly.is_empty:
-                                    pt_c = inter_poly.representative_point()
-                                    target_c = Position(pt_c.x, pt_c.y)
-                                    must_targets[i] = target_c
-                                    must_targets[j] = target_c
-                                    active_polys[i] = inter_poly
-                                    active_polys[j] = inter_poly
-                                    changed = True
-                                    console.print(
-                                        f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={pi}) | note(pos={pj}) => 2x note(pos={target_c})[/yellow]"
-                                    )
-                if not changed:
-                    break
+            if len(must_notes) > 1:
+                groups: list[list[int]] = [[i] for i in range(len(must_notes))]
+                zones: list[Polygon] = []
+                while True:
+                    merged = False
+                    zones = []
+                    for gi, members in enumerate(groups):
+                        own = active_polys[members[0]]
+                        for m in members[1:]:
+                            own = intersection(own, active_polys[m])
+                        rest = [j for j in range(len(must_notes)) if j not in members]
+                        free = difference(own, union_all([exclude_polys[j] for j in rest]))
+                        if not zone_ok(free):
+                            free = difference(own, union_all([active_polys[j] for j in rest])).buffer(-screen.width * 0.02)
+                        if zone_ok(free):
+                            zones.append(free)
+                            continue
+                        # 和判定带重叠最多的那组合并
+                        best = None
+                        for gj, others in enumerate(groups):
+                            if gj == gi:
+                                continue
+                            cand = own
+                            for o in others:
+                                cand = intersection(cand, active_polys[o])
+                            if zone_ok(cand) and (best is None or cand.area > best[1].area):
+                                best = (gj, cand)
+                        if best is None:
+                            zones.append(own)
+                            continue
+                        groups[gi] = members + groups[best[0]]
+                        del groups[best[0]]
+                        merged = True
+                        break
+                    if not merged:
+                        break
+                for members, zone in zip(groups, zones):
+                    target = pick_point(zone, must_notes[members[0]].position)
+                    pt = Point(target.real, target.imag)
+                    clash = [j for j in range(len(must_notes)) if j not in members and active_polys[j].intersects(pt)]
+                    if clash:
+                        console.print(f"[red]多押重叠调整失败：timestamp @ {timestamp}: note(pos={target}) 落在 {len(clash)} 个别的 note 判定带里[/red]")
+                    for i in members:
+                        if abs(target - must_notes[i].position) > 1e-5:
+                            console.print(f"[yellow]多押重叠调整：timestamp @ {timestamp}: note(pos={must_notes[i].position}) => note(pos={target})[/yellow]")
+                        must_targets[i] = target
+            else:
+                for i, note in enumerate(must_notes):
+                    must_targets[i] = pick_point(active_polys[i], note.position)
             
+            # 刚DOWN的指针不能MOVE
+            downed_pids: set[PointerID] = {pid for pid in pointers.down_ts if pointers.settling(pid)}
             for note, target in zip(must_notes, must_targets):
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
+                if note.id in pointers.occupied:
+                    pointers.free(note)
                 pid, is_down = pointers.alloc(
                     SemiNote(note.type, target, note.id, note.rotation),
                     line_ref=line_ref,
@@ -598,6 +721,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 if note.type == SemiNoteType.TAP:
                     to_free.append(note)
                 confirmed_pointers[pid] = target
+                downed_pids.add(pid)
             current_touches.update(confirmed_pointers)
             flicking_pids = {
                 r.id for r in pointers.occupied.values()
@@ -606,12 +730,12 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             for note in may_notes:
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
-                poly_n = JudgeArea(note.position, note.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
+                poly_n = judge_zone(note.position, note.rotation, JUDGE_HALF_DRAG)
                 candidates = []
                 covering_pid = None
                 covering_pos = None
                 for pid, p_touch in current_touches.items():
-                    if pid in flicking_pids:
+                    if pid in flicking_pids or pid in downed_pids:
                         continue
                     if poly_n.intersects(Point(p_touch.real, p_touch.imag)):
                         dist = abs(p_touch - note.position)
@@ -650,87 +774,151 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     confirmed_pointers[pid] = note.position
             current_touches = active_physical_touches.copy()
             current_touches.update(confirmed_pointers)
-            for note in passive_notes:
-                poly_n = JudgeArea(note.position, note.rotation, screen.width, screen.height).get_valid_poly(screen_poly, pause_poly)
-                self_record = pointers.occupied.get(note.id)
-                self_pid = self_record.id if self_record is not None else None
-                is_self_covered = False
-                if self_pid is not None and self_pid in current_touches:
-                    actual_pos = current_touches[self_pid]
-                    if poly_n.intersects(Point(actual_pos.real, actual_pos.imag)):
-                        is_self_covered = True
-                        self_record = self_record._replace(position=actual_pos)
-                is_covered = False
+            hold_notes = [n for n in passive_notes if n.type in (SemiNoteType.HOLD, SemiNoteType.HOLD_END)]
+            drag_notes = [n for n in passive_notes if n.type == SemiNoteType.DRAG]
+
+            def bind_holds(pid: PointerID, pos: Position, notes: list[SemiNote]) -> None:
+                for n in notes:
+                    old = pointers.occupied.get(n.id)
+                    if old is not None and old.id != pid:
+                        pointers.free(n)
+                    if pid in pointers.unused:
+                        del pointers.unused[pid]
+                    pointers.occupied[n.id] = PointerRecord(
+                        pid, pos, timestamp, note_id_to_line.get(n.id), note_id_to_offset.get(n.id, 0.0), n.type
+                    )
+                    if n.type == SemiNoteType.HOLD_END:
+                        to_free.append(n)
+                pointers.last_active_ts[pid] = timestamp
+
+            # 一帧内所有Hold一起做覆盖
+            # 否则像 RetributionSP，每条 Hold 都要一个指针就完蛋了
+            if hold_notes:
+                hold_polys = {n.id: judge_zone(n.position, n.rotation) for n in hold_notes}
+                pending = [n for n in hold_notes if zone_ok(hold_polys[n.id])]
+                groups: list[tuple[list[SemiNote], Polygon, PointerID | None]] = []
+                for pid in downed_pids:
+                    p_touch = current_touches.get(pid)
+                    if p_touch is None:
+                        continue
+                    pt = Point(p_touch.real, p_touch.imag)
+                    anchored = [n for n in pending if hold_polys[n.id].intersects(pt)]
+                    if anchored:
+                        groups.append((anchored, hold_polys[anchored[0].id], pid))
+                        pending = [n for n in pending if n not in anchored]
+                while pending:
+                    best_group: list[SemiNote] = []
+                    best_inter = None
+                    for seed in pending:
+                        inter = hold_polys[seed.id]
+                        group = [seed]
+                        for n in sorted(pending, key=lambda n: abs(n.position - seed.position)):
+                            if n is seed:
+                                continue
+                            cand = intersection(inter, hold_polys[n.id])
+                            if zone_ok(cand):
+                                inter = cand
+                                group.append(n)
+                        if len(group) > len(best_group):
+                            best_group, best_inter = group, inter
+                    groups.append((best_group, best_inter, None))
+                    grouped = {n.id for n in best_group}
+                    pending = [n for n in pending if n.id not in grouped]
+                used_pids: set[PointerID] = set()
+                for group, inter, fixed_pid in groups:
+                    members = {n.id for n in group}
+                    candidates = []
+                    for pid, p_touch in current_touches.items():
+                        if fixed_pid is not None and pid != fixed_pid:
+                            continue
+                        if pid in used_pids or not inter.intersects(Point(p_touch.real, p_touch.imag)):
+                            continue
+                        if fixed_pid is None and max(abs(((p_touch - n.position) * n.rotation.conjugate()).real) for n in group) > hold_keep:
+                            continue
+                        bound = sum(1 for rec in pointers.occupied.values() if rec.id == pid)
+                        candidates.append((pid in flicking_pids, -bound, pid))
+                    if candidates:
+                        pid = min(candidates)[2]
+                        target = current_touches[pid]
+                        act = None
+                    else:
+                        # 交集的质心离各条判定带的边最远
+                        pt = inter.centroid
+                        if not inter.contains(pt):
+                            pt = inter.representative_point()
+                        target = Position(pt.x, pt.y)
+                        # 把组里Hold自己的指针拿过来，优先没有其他Hold按着的
+                        owners = []
+                        for n in group:
+                            rec = pointers.occupied.get(n.id)
+                            if rec is None or rec.id in used_pids or rec.id in flicking_pids or rec.id in downed_pids:
+                                continue
+                            others = sum(1 for nid, r in pointers.occupied.items() if r.id == rec.id and nid not in members)
+                            owners.append((others, rec.id))
+                        if owners:
+                            pid = min(owners)[1]
+                            act = TouchAction.MOVE
+                        else:
+                            head = group[0]
+                            if head.id in pointers.occupied:
+                                pointers.free(head)
+                            pid, is_down = pointers.alloc(
+                                SemiNote(head.type, target, head.id, head.rotation), new=False,
+                                line_ref=note_id_to_line.get(head.id), note_offset=note_id_to_offset.get(head.id, 0.0)
+                            )
+                            if pid is None:
+                                continue
+                            act = TouchAction.DOWN if is_down else TouchAction.MOVE
+                    if act == TouchAction.MOVE and abs(current_touches.get(pid, math.inf) - target) < 1e-6:
+                        # 已经在质心上了，不用再发一次
+                        act = None
+                    if act is not None:
+                        result[timestamp].append(VirtualTouchEvent(target, act, pid))
+                        confirmed_pointers[pid] = target
+                        current_touches[pid] = target
+                    bind_holds(pid, target, group)
+                    used_pids.add(pid)
+
+            for note in drag_notes:
+                poly_n = judge_zone(note.position, note.rotation, JUDGE_HALF_DRAG)
                 covering_pid = None
                 covering_pos = None
                 for pid, p_touch in current_touches.items():
-                    if pid == self_pid:
-                        continue
                     if poly_n.intersects(Point(p_touch.real, p_touch.imag)):
-                        is_covered = True
                         covering_pid = pid
                         covering_pos = p_touch
                         break
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
-                if is_covered:
-                    if note.type == SemiNoteType.DRAG:
-                        # unused 随时可能被拿走，需要临时occupied一下
-                        if covering_pid in pointers.unused:
-                            del pointers.unused[covering_pid]
-                            pointers.occupied[note.id] = PointerRecord(
-                                id=covering_pid, 
-                                position=covering_pos, 
-                                timestamp=timestamp, 
-                                line_ref=line_ref, 
-                                note_offset=offset_val, 
-                                note_type=note.type
-                            )
-                            to_free.append(note)
-                        continue
-                    elif note.type == SemiNoteType.HOLD:
-                        if covering_pid is not None:
-                            if note.id in pointers.occupied:
-                                pointers.free(note)
-                            if covering_pid in pointers.unused:
-                                del pointers.unused[covering_pid]
-                            pointers.occupied[note.id] = PointerRecord(covering_pid, covering_pos, timestamp, line_ref, offset_val, note.type)
-                    elif note.type == SemiNoteType.HOLD_END:
-                        if note.id in pointers.occupied:
-                            to_free.append(note)
-                elif note.type in (SemiNoteType.HOLD, SemiNoteType.HOLD_END) and is_self_covered:
-                    pointers.occupied[note.id] = PointerRecord(self_pid, self_record.position, timestamp, line_ref, offset_val, note.type)
-                    pointers.last_active_ts[self_pid] = timestamp
-                    confirmed_pointers[self_pid] = self_record.position
-                    current_touches[self_pid] = self_record.position
-                    if note.type == SemiNoteType.HOLD_END:
+                if covering_pid is not None:
+                    # unused 随时可能被拿走，需要临时occupied一下
+                    if covering_pid in pointers.unused:
+                        del pointers.unused[covering_pid]
+                        pointers.occupied[note.id] = PointerRecord(
+                            id=covering_pid, 
+                            position=covering_pos, 
+                            timestamp=timestamp, 
+                            line_ref=line_ref, 
+                            note_offset=offset_val, 
+                            note_type=note.type
+                        )
                         to_free.append(note)
-                else:
-                    if note.type == SemiNoteType.DRAG:
-                        pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
-                        if pid is None:
-                            continue
-                        act = TouchAction.DOWN if is_down else TouchAction.MOVE
-                        result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
-                        to_free.append(note)
-                        confirmed_pointers[pid] = note.position
-                        current_touches[pid] = note.position 
-                    elif note.type in (SemiNoteType.HOLD, SemiNoteType.HOLD_END):
-                        if note.id in pointers.occupied:
-                            pointers.free(note)
-                        pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
-                        if pid is None:
-                            continue
-                        act = TouchAction.DOWN if is_down else TouchAction.MOVE
-                        result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
-                        confirmed_pointers[pid] = note.position
-                        current_touches[pid] = note.position
-                        if note.type == SemiNoteType.HOLD_END:
-                            to_free.append(note)
+                    continue
+                pid, is_down = pointers.alloc(note, new=False, line_ref=line_ref, note_offset=offset_val)
+                if pid is None:
+                    continue
+                act = TouchAction.DOWN if is_down else TouchAction.MOVE
+                result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
+                to_free.append(note)
+                confirmed_pointers[pid] = note.position
+                current_touches[pid] = note.position
             
             for note_to_free in to_free:
                 pointers.free(note_to_free)
             
+            for event in result.get(timestamp, ()):
+                if event.action != TouchAction.UP:
+                    pointer_pos[event.pointer_id] = event.pos
             for ptr, up_ts in pointers.recycle():
                 result[up_ts].append(VirtualTouchEvent(ptr.position, TouchAction.UP, ptr.id))
             
