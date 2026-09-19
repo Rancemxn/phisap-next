@@ -44,6 +44,8 @@ class SemiNoteType(Enum):
     HOLD_START = 5
     HOLD = 6
     HOLD_END = 7
+    FLICK_TAIL = 8
+    FLICK_TAIL_END = 9
 
     @property
     def down_need(self) -> DownNeed:
@@ -54,7 +56,9 @@ class SemiNoteType(Enum):
             SemiNoteType.HOLD, 
             SemiNoteType.HOLD_END, 
             SemiNoteType.FLICK, 
-            SemiNoteType.FLICK_END
+            SemiNoteType.FLICK_END,
+            SemiNoteType.FLICK_TAIL,
+            SemiNoteType.FLICK_TAIL_END
         ):
             return DownNeed.NEVER
         return DownNeed.MAY
@@ -80,6 +84,9 @@ FLICK_STAGGER = 30
 FLICK_STAGGER_MAX = 60
 # 滑动轨迹允许偏离自己判定中线的比例
 FLICK_LATERAL = 0.5
+# Phira 的 PreJudge 到帧末才结算，同帧的几个滑动可能重复选中同一个 Flick。
+# 原轨迹之后继续滑动一小段，给剩余 Flick 留出下一帧的判定机会。
+FLICK_TAIL = 34
 
 class JudgeArea:
     __slots__ = ('center', 'rotation', 'poly', 'half_width')
@@ -123,11 +130,11 @@ class PointerRecord(NamedTuple):
     position: Position
     timestamp: int
     line_ref: Any = None
-    note_offset: float = 0.0
+    note_offset: Position = 0j
     note_type: SemiNoteType | None = None
 
 class PointerManager:
-    __slots__ = ('occupied', 'idle', 'unused', 'last_active_ts', 'down_ts', 'waiting_liftup', 'current_ts', 'console', 'noway')
+    __slots__ = ('occupied', 'idle', 'unused', 'last_active_ts', 'down_ts', 'waiting_liftup', 'current_ts', 'console', 'noway', 'cancelled_flicks')
 
     def __init__(self, pointer_ids: Iterable[PointerID], console: Console, noway: bool = False) -> None:
         self.occupied: dict[NoteID, PointerRecord] = {}
@@ -139,8 +146,9 @@ class PointerManager:
         self.current_ts: int = 0
         self.console: Console = console
         self.noway: bool = noway
+        self.cancelled_flicks: set[NoteID] = set()
 
-    def alloc(self, note: SemiNote, new: bool = True, line_ref: Any = None, note_offset: float = 0.0) -> tuple[PointerID | None, bool]:
+    def alloc(self, note: SemiNote, new: bool = True, line_ref: Any = None, note_offset: Position = 0j) -> tuple[PointerID | None, bool]:
         nid = note.id
         if nid in self.occupied:
             ptr = self.occupied[nid]
@@ -189,6 +197,24 @@ class PointerManager:
             self.down_ts[ptr.id] = self.current_ts
             return ptr.id, True
         
+        # 补充滑动可以让位，但不能抢走仍在维持 Hold 的共享指针。
+        tails = [
+            (tail_id, ptr) for tail_id, ptr in self.occupied.items()
+            if ptr.note_type in (SemiNoteType.FLICK_END, SemiNoteType.FLICK_TAIL, SemiNoteType.FLICK_TAIL_END)
+            and not any(other_id != tail_id and other.id == ptr.id for other_id, other in self.occupied.items())
+        ]
+        if tails:
+            tail_id, ptr = min(tails, key=lambda item: abs(note.position - item[1].position))
+            del self.occupied[tail_id]
+            self.cancelled_flicks.add(tail_id)
+            if new:
+                up_ts = (ptr.timestamp + self.current_ts) // 2 if self.current_ts > ptr.timestamp + 1 else self.current_ts - 1
+                self.waiting_liftup.append((ptr, max(0, up_ts)))
+                self.down_ts[ptr.id] = self.current_ts
+            self.occupied[nid] = PointerRecord(ptr.id, note.position, self.current_ts, line_ref, note_offset, note.type)
+            self.last_active_ts[ptr.id] = self.current_ts
+            return ptr.id, new
+
         if self.noway:
             self.console.print(f"[red]Note({note}) @ {self.current_ts} 规划失败[/red]")
             return None, False
@@ -238,6 +264,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     noway = config['algo4_continue_when_failed']
     flick_dir = 1j if config['algo4_flick_direction'] == 0 else 1
     flick_duration = flick_end - flick_start
+    flick_release = flick_end + FLICK_TAIL
     padding_x = screen.width * 0.05
     padding_y = screen.height * 0.05
     screen_poly = Polygon([
@@ -301,9 +328,14 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     max_frame_must = 0
     max_frame_may = 0
     note_id_to_line: dict[NoteID, Any] = {}
-    note_id_to_offset: dict[NoteID, float] = {}
+    note_id_to_offset: dict[NoteID, Position] = {}
     sweep_registry: defaultdict[int, list[SweepTarget]] = defaultdict(list)
     deferred_flicks: list[dict] = []
+
+    def note_zone(note: SemiNote, seconds: float, half: float = JUDGE_HALF_TAP) -> Polygon:
+        line = note_id_to_line[note.id]
+        rotation = cmath.exp((line.angle @ seconds) * 1j)
+        return judge_zone(line.pos(seconds, note_id_to_offset[note.id]), rotation, half)
 
     def pick_point(poly: Polygon, near: Position) -> Position:
         pt = Point(near.real, near.imag)
@@ -320,19 +352,21 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             return DOWN_SETTLE
         return DOWN_LATENCY
 
-    def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj, window: int = DOWN_LATENCY) -> tuple[float, Position, Vector, float, bool]:
+    def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj, window: int = DOWN_LATENCY) -> tuple[float, Position, Vector, Position, bool]:
+        # 输出按毫秒量化；在量化后的时刻求几何，避免恰好落到瞬移/翻转事件的另一侧。
+        base_sec = round(base_sec * 1000) / 1000.0
+        base_rot = cmath.exp((line_obj.angle @ base_sec) * 1j)
+        base_pos = line_obj.pos(base_sec, note_offset)
         valid_touch_zone, _ = down_zone(line_obj, base_sec, note_offset, window)
         if zone_ok(valid_touch_zone):
             orig_point = Point(base_pos.real, base_pos.imag)
             closest_geom = nearest_points(valid_touch_zone, orig_point)[0]
             closest_pos = Position(closest_geom.x, closest_geom.y)
-            line_center = line_obj.position @ base_sec
-            delta = closest_pos - line_center
-            new_offset = (delta * base_rot.conjugate()).real
+            # 这里只移动触点。谱面里的局部坐标不变，后续仍以原判定带为准。
             adjusted = abs(closest_pos - base_pos) > 1e-5
             if adjusted:
                 console.print(f"[yellow]判定区域微调：note @ {base_sec} of (pos={base_pos},rot={base_rot}) => (pos={closest_pos})[/yellow]")
-            return base_sec, closest_pos, base_rot, new_offset, adjusted
+            return base_sec, closest_pos, base_rot, note_offset, adjusted
 
         for dt in range(1, 16):
             for sign in (-1, 1):
@@ -346,28 +380,49 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     orig_point_at_t = Point(new_note_pos.real, new_note_pos.imag)
                     closest_geom = nearest_points(new_valid_zone, orig_point_at_t)[0]
                     closest_pos = Position(closest_geom.x, closest_geom.y)
-                    delta = closest_pos - new_lp
-                    new_offset = (delta * new_rot.conjugate()).real
                     console.print(f"[yellow]判定时间微调：note @ {base_sec} of (pos={base_pos},rot={base_rot})=> note @ {new_time} of (pos={closest_pos},rot={new_rot})[/yellow]")
-                    return new_time, closest_pos, new_rot, new_offset, True
+                    return new_time, closest_pos, new_rot, note_offset, True
         
         console.print(f"[red]判定微调失败：note @ {base_sec} of (pos={base_pos},rot={base_rot})[/red]")
         return base_sec, base_pos, base_rot, note_offset, False
 
-    def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, start_off: int, shift: float = 0.0) -> Position:
-        rate = 1 - 2 * (offset_ms - start_off) / flick_duration
-        return pos + rot * f_dir * (screen.flick_radius * rate + shift)
+    def flick_rate(offset_ms: int, tail_direction: int = -1) -> float:
+        if offset_ms > flick_end:
+            return -1 + tail_direction * (offset_ms - flick_end) / FLICK_TAIL
+        return 1 - 2 * (offset_ms - flick_start) / flick_duration
 
-    def fit_flick(pos: Position, rot: Vector, f_dir: Vector, band: Polygon) -> float | None:
-        # 轨迹在屏幕外时，沿滑动方向整体平移下，平移量越小越好
+    def flick_pos(pos: Position, offset_ms: int, rot: Vector, f_dir: Vector, shift: float = 0.0, tail_direction: int = -1) -> Position:
+        return pos + rot * f_dir * (screen.flick_radius * flick_rate(offset_ms, tail_direction) + shift)
+
+    def fit_flick(
+        pos: Position, rot: Vector, f_dir: Vector, band: Polygon, tail_zones: list[tuple[int, Polygon]]
+    ) -> tuple[float, int] | None:
+        # 先固定原滑动的最小平移量，补滑不能反过来改变已可用的主轨迹。
         for step in range(0, 16):
             for sign in ((1,) if step == 0 else (-1, 1)):
                 shift = sign * step * screen.flick_radius * 0.1
-                if all(
+                if not all(
                     band.intersects(Point(p.real, p.imag))
-                    for p in (flick_pos(pos, off, rot, f_dir, flick_start, shift) for off in flick_eval_offsets)
+                    for p in (flick_pos(pos, off, rot, f_dir, shift) for off in flick_main_offsets)
                 ):
-                    return shift
+                    continue
+                # 角落可折返；转动的线则比较补滑时真正的判定带覆盖。
+                best = None
+                for tail_direction in (-1, 1):
+                    if not all(
+                        band.intersects(Point(p.real, p.imag))
+                        for p in (flick_pos(pos, off, rot, f_dir, shift, tail_direction) for off in flick_eval_offsets)
+                    ):
+                        continue
+                    coverage = sum(
+                        zone.intersects(Point(p.real, p.imag))
+                        for off, zone in tail_zones
+                        for p in (flick_pos(pos, off, rot, f_dir, shift, tail_direction),)
+                    )
+                    if best is None or coverage > best[0]:
+                        best = (coverage, tail_direction)
+                if best is not None:
+                    return shift, best[1]
         return None
     
     frames: defaultdict[int, list[SemiNote]] = defaultdict(list)
@@ -376,6 +431,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     flick_eval_offsets = [flick_start] + list(range(flick_start + 1, flick_end, sample_delay))
     if flick_eval_offsets[-1] != flick_end:
         flick_eval_offsets.append(flick_end)
+    flick_main_offsets = flick_eval_offsets.copy()
+    flick_eval_offsets.extend(range(flick_end + sample_delay, flick_release, sample_delay))
+    flick_eval_offsets.append(flick_release)
     
     total_notes = sum(len(line.notes) for line in chart.lines)
 
@@ -406,7 +464,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         frames[ts].append(SemiNote(SemiNoteType.TAP, adj_pos, current_note_id, adj_rot))
                         dense_frame_sizes[ts] += 1
                     case NoteType.DRAG:
-                        poly = judge_zone(adj_pos, adj_rot, JUDGE_HALF_DRAG)
+                        poly = judge_zone(line.pos(adj_time, note.offset), adj_rot, JUDGE_HALF_DRAG)
                         sn = SemiNote(SemiNoteType.DRAG, adj_pos, current_note_id, adj_rot)
                         sweep_registry[ts].append(SweepTarget(sn, poly))
                     case NoteType.FLICK:
@@ -479,13 +537,13 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             candidates_targets = []
             # 这里整块逻辑都不能追踪flick的偏转，必须以判定时间为准
             # 不然有的绑线flick判定时间后就飞走了，计算出来的flick_pos就不是直线了
-            for off in flick_eval_offsets:
+            for off in flick_main_offsets:
                 for target in sweep_registry.get(base_ts + off, []):
                     if not target.is_swept:
                         candidates_targets.append((base_ts + off, target, off))
             candidate_dirs = [flick_dir, -flick_dir]
             for tick_ts, target, off in candidates_targets:
-                rate = 1 - 2 * (off - flick_start) / flick_duration
+                rate = flick_rate(off)
                 if abs(rate) < 1e-3: 
                     continue
                 vec = (target.note.position - base_pos) / (base_rot * screen.flick_radius * rate)
@@ -493,17 +551,27 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     candidate_dirs.append(vec / abs(vec))
             best_dir = flick_dir
             best_shift = 0.0
+            best_tail_direction = -1
             max_swept = -1
             best_swept_targets = []
             flick_band = judge_zone(base_pos, base_rot, JUDGE_HALF_DRAG, JUDGE_MARGIN * FLICK_LATERAL)
-            for c_dir in candidate_dirs:
-                shift = fit_flick(base_pos, base_rot, c_dir, flick_band)
-                if shift is None:
+            tail_zones = []
+            for off in flick_eval_offsets:
+                if off <= flick_end:
                     continue
+                for latency in (0, DOWN_LATENCY // 2):
+                    t_tail = (base_ts + off + latency) / 1000.0
+                    rot_tail = cmath.exp((line.angle @ t_tail) * 1j)
+                    tail_zones.append((off, judge_zone(line.pos(t_tail, note_id_to_offset[nid]), rot_tail, JUDGE_HALF_DRAG)))
+            for c_dir in candidate_dirs:
+                fitted = fit_flick(base_pos, base_rot, c_dir, flick_band, tail_zones)
+                if fitted is None:
+                    continue
+                shift, tail_direction = fitted
                 current_swept = []
-                for off in flick_eval_offsets:
+                for off in flick_main_offsets:
                     tick_ts = base_ts + off
-                    p_flick = flick_pos(base_pos, off, base_rot, c_dir, flick_start, shift)
+                    p_flick = flick_pos(base_pos, off, base_rot, c_dir, shift, tail_direction)
                     test_point = Point(p_flick.real, p_flick.imag)
                     for target in sweep_registry.get(tick_ts, []):
                         if not target.is_swept and target.poly.intersects(test_point):
@@ -512,6 +580,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     max_swept = len(current_swept)
                     best_dir = c_dir
                     best_shift = shift
+                    best_tail_direction = tail_direction
                     best_swept_targets = current_swept
             if max_swept == -1:
                 console.print(f"[red]滑动轨迹出屏：note @ {base_ts} (pos={base_pos})[/red]")
@@ -519,14 +588,19 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 target.is_swept = True
             for off in flick_eval_offsets:
                 tick_ts = base_ts + off
-                p_flick = flick_pos(base_pos, off, base_rot, best_dir, flick_start, best_shift)
+                p_flick = flick_pos(base_pos, off, base_rot, best_dir, best_shift, best_tail_direction)
                 if off == flick_start:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_START, p_flick, nid, base_rot))
                 elif off == flick_end:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_END, p_flick, nid, base_rot))
+                elif off == flick_release:
+                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_TAIL_END, p_flick, nid, base_rot))
+                elif off > flick_end:
+                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_TAIL, p_flick, nid, base_rot))
                 else:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK, p_flick, nid, base_rot))
-                dense_frame_sizes[tick_ts] += 1
+                if off <= flick_end:
+                    dense_frame_sizes[tick_ts] += 1
             progress.advance(task2, 1)
         
         task3 = progress.add_task("平移超载帧...", total=len(frames))
@@ -536,7 +610,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     n for n in frames[ts] 
                     if n.type in (SemiNoteType.TAP, SemiNoteType.HOLD_START, SemiNoteType.FLICK_START)
                 ]
-                if len(frames[ts]) <= 10 or not must_may_notes:
+                if dense_frame_sizes[ts] <= 10 or not must_may_notes:
                     break
                 note_to_shift = must_may_notes[0]
                 nid = note_to_shift.id
@@ -550,7 +624,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         target_ts = ts + dt * sign
                         if target_ts < 0:
                             continue
-                        density = len(frames[target_ts])
+                        density = dense_frame_sizes[target_ts]
                         if density < min_density and density < 10:
                             min_density = density
                             best_target_ts = target_ts
@@ -588,7 +662,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 if note.type == NoteType.HOLD:
                     hold_ranges.append((start_ms, start_ms + math.ceil(note.hold * 1000), -1))
                 elif note.type == NoteType.FLICK:
-                    flick_ranges.append((start_ms + flick_start, start_ms + flick_end))
+                    flick_ranges.append((start_ms + flick_start, start_ms + flick_release))
 
         ranges = hold_ranges + [(s, e, -1) for s, e in flick_ranges]
         if ranges:
@@ -636,7 +710,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     must_notes.append(note)
                 elif note.type == SemiNoteType.FLICK_START:
                     may_notes.append(note)
-                elif note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END):
+                elif note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END, SemiNoteType.FLICK_TAIL, SemiNoteType.FLICK_TAIL_END):
                     active_never.append(note)
                 elif note.type in (SemiNoteType.HOLD, SemiNoteType.DRAG, SemiNoteType.HOLD_END):
                     passive_notes.append(note)
@@ -649,7 +723,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 window = down_window(n.type)
                 inter, _ = down_zone(line_ref, t_sec, offset_val, window)
                 if not zone_ok(inter):
-                    inter = judge_zone(n.position, n.rotation)
+                    inter = note_zone(n, t_sec)
                 active_polys.append(inter)
                 exclude_polys.append(down_zone(line_ref, t_sec, offset_val, window, JUDGE_HALF_DRAG, JUDGE_EXCLUDE)[1])
             must_targets = [n.position for n in must_notes]
@@ -665,8 +739,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                             own = intersection(own, active_polys[m])
                         rest = [j for j in range(len(must_notes)) if j not in members]
                         free = difference(own, union_all([exclude_polys[j] for j in rest]))
-                        if not zone_ok(free):
-                            free = difference(own, union_all([active_polys[j] for j in rest])).buffer(-screen.width * 0.02)
+                        # 避让必须用真实判定带的并集，不能退回缩窄的规划区。
+                        # 否则多个触点会互抢同一颗 Tap，剩余触点还可能抢到下一拍。
                         if zone_ok(free):
                             zones.append(free)
                             continue
@@ -725,7 +799,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             current_touches.update(confirmed_pointers)
             flicking_pids = {
                 r.id for r in pointers.occupied.values()
-                if r.note_type in (SemiNoteType.FLICK_START, SemiNoteType.FLICK, SemiNoteType.FLICK_END)
+                if r.note_type in (SemiNoteType.FLICK_START, SemiNoteType.FLICK, SemiNoteType.FLICK_END, SemiNoteType.FLICK_TAIL, SemiNoteType.FLICK_TAIL_END)
             }
             for note in may_notes:
                 line_ref = note_id_to_line.get(note.id)
@@ -762,14 +836,16 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     current_touches[pid] = note.position
                     flicking_pids.add(pid)
             for note in active_never:
+                if note.id in pointers.cancelled_flicks:
+                    continue
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
-                if note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END):
+                if note.type in (SemiNoteType.FLICK, SemiNoteType.FLICK_END, SemiNoteType.FLICK_TAIL, SemiNoteType.FLICK_TAIL_END):
                     pid, _ = pointers.alloc(note, line_ref=line_ref, note_offset=offset_val)
                     if pid is None:
                         continue
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
-                    if note.type == SemiNoteType.FLICK_END:
+                    if note.type == SemiNoteType.FLICK_TAIL_END:
                         to_free.append(note)
                     confirmed_pointers[pid] = note.position
             current_touches = active_physical_touches.copy()
@@ -794,7 +870,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             # 一帧内所有Hold一起做覆盖
             # 否则像 RetributionSP，每条 Hold 都要一个指针就完蛋了
             if hold_notes:
-                hold_polys = {n.id: judge_zone(n.position, n.rotation) for n in hold_notes}
+                hold_polys = {n.id: note_zone(n, t_sec) for n in hold_notes}
                 pending = [n for n in hold_notes if zone_ok(hold_polys[n.id])]
                 groups: list[tuple[list[SemiNote], Polygon, PointerID | None]] = []
                 for pid in downed_pids:
@@ -880,7 +956,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     used_pids.add(pid)
 
             for note in drag_notes:
-                poly_n = judge_zone(note.position, note.rotation, JUDGE_HALF_DRAG)
+                poly_n = note_zone(note, t_sec, JUDGE_HALF_DRAG)
                 covering_pid = None
                 covering_pos = None
                 for pid, p_touch in current_touches.items():
