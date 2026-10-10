@@ -42,7 +42,7 @@ from controllers import ScrcpyController, HIDController, GranularAnswerItem, Vis
 
 from chart import load_chart
 
-PHISAP_VERSION = '0.22'
+PHISAP_VERSION = '0.23'
 
 
 class ExtractPackageWorker(QThread):
