@@ -18,6 +18,7 @@ from shapely import (
     centroid,
     difference,
     union_all,
+    intersects_xy,
 )
 from shapely.ops import nearest_points
 
@@ -26,6 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from basis import Chart, NoteType, Position, Vector
 from .base import RawAnswerType, TouchAction, VirtualTouchEvent, ScreenUtil, AlgorithmConfigure
+from .blocks import BlockGuard, BlockPlanningError
 
 PointerID: TypeAlias = int
 NoteID: TypeAlias = int
@@ -84,8 +86,7 @@ FLICK_STAGGER = 30
 FLICK_STAGGER_MAX = 60
 # 滑动轨迹允许偏离自己判定中线的比例
 FLICK_LATERAL = 0.5
-# Phira 的 PreJudge 到帧末才结算，同帧的几个滑动可能重复选中同一个 Flick。
-# 原轨迹之后继续滑动一小段，给剩余 Flick 留出下一帧的判定机会。
+# 原轨迹之后继续滑动一小段，给剩余 Flick 留出下一帧的判定机会
 FLICK_TAIL = 34
 
 class JudgeArea:
@@ -197,7 +198,7 @@ class PointerManager:
             self.down_ts[ptr.id] = self.current_ts
             return ptr.id, True
         
-        # 补充滑动可以让位，但不能抢走仍在维持 Hold 的共享指针。
+        # 不能抢走仍在Hold的指针
         tails = [
             (tail_id, ptr) for tail_id, ptr in self.occupied.items()
             if ptr.note_type in (SemiNoteType.FLICK_END, SemiNoteType.FLICK_TAIL, SemiNoteType.FLICK_TAIL_END)
@@ -258,10 +259,13 @@ class SweepTarget:
 
 def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
     screen = ScreenUtil(chart.width, chart.height)
+    guard = BlockGuard(chart) if chart.block_areas else None
+    if guard:
+        console.print(f'噪域规划：{len(chart.block_areas.areas)} 个区域')
     flick_start = config['algo4_flick_start']
     flick_end = config['algo4_flick_end']
-    sample_delay = config['algo4_sample_delay']
-    noway = config['algo4_continue_when_failed']
+    sample_delay = 1 if guard else config['algo4_sample_delay']
+    noway = False if guard else config['algo4_continue_when_failed']
     flick_dir = 1j if config['algo4_flick_direction'] == 0 else 1
     flick_duration = flick_end - flick_start
     flick_release = flick_end + FLICK_TAIL
@@ -313,10 +317,13 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         zones = down_zone_cache.get(key)
         if zones is None:
             inter = union = None
-            for k in range(4):
-                t_i = t + window * k / 3 / 1000.0
+            steps = range(window + 1) if guard else (window * k / 3 for k in range(4))
+            for step in steps:
+                t_i = t + step / 1000.0
                 rot_i = cmath.exp((line_obj.angle @ t_i) * 1j)
                 poly_i = judge_zone(line_obj.position @ t_i + rot_i * offset, rot_i, half, scale)
+                if guard:
+                    poly_i = guard.clip(poly_i, t_i)
                 inter = poly_i if inter is None else intersection(inter, poly_i)
                 union = poly_i if union is None else union.union(poly_i)
             zones = (inter, union)
@@ -335,7 +342,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
     def note_zone(note: SemiNote, seconds: float, half: float = JUDGE_HALF_TAP) -> Polygon:
         line = note_id_to_line[note.id]
         rotation = cmath.exp((line.angle @ seconds) * 1j)
-        return judge_zone(line.pos(seconds, note_id_to_offset[note.id]), rotation, half)
+        zone = judge_zone(line.pos(seconds, note_id_to_offset[note.id]), rotation, half)
+        return guard.clip(zone, seconds) if guard else zone
 
     def pick_point(poly: Polygon, near: Position) -> Position:
         pt = Point(near.real, near.imag)
@@ -353,7 +361,6 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         return DOWN_LATENCY
 
     def find_visible_pos(base_sec, base_pos, base_rot, note_offset, line_obj, window: int = DOWN_LATENCY) -> tuple[float, Position, Vector, Position, bool]:
-        # 输出按毫秒量化；在量化后的时刻求几何，避免恰好落到瞬移/翻转事件的另一侧。
         base_sec = round(base_sec * 1000) / 1000.0
         base_rot = cmath.exp((line_obj.angle @ base_sec) * 1j)
         base_pos = line_obj.pos(base_sec, note_offset)
@@ -362,7 +369,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             orig_point = Point(base_pos.real, base_pos.imag)
             closest_geom = nearest_points(valid_touch_zone, orig_point)[0]
             closest_pos = Position(closest_geom.x, closest_geom.y)
-            # 这里只移动触点。谱面里的局部坐标不变，后续仍以原判定带为准。
+            # 只移动触点
             adjusted = abs(closest_pos - base_pos) > 1e-5
             if adjusted:
                 console.print(f"[yellow]判定区域微调：note @ {base_sec} of (pos={base_pos},rot={base_rot}) => (pos={closest_pos})[/yellow]")
@@ -384,6 +391,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     return new_time, closest_pos, new_rot, note_offset, True
         
         console.print(f"[red]判定微调失败：note @ {base_sec} of (pos={base_pos},rot={base_rot})[/red]")
+        if guard:
+            raise BlockPlanningError(f'No unblocked judgement region at {base_sec:.3f}s')
         return base_sec, base_pos, base_rot, note_offset, False
 
     def flick_rate(offset_ms: int, tail_direction: int = -1) -> float:
@@ -395,34 +404,54 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         return pos + rot * f_dir * (screen.flick_radius * flick_rate(offset_ms, tail_direction) + shift)
 
     def fit_flick(
-        pos: Position, rot: Vector, f_dir: Vector, band: Polygon, tail_zones: list[tuple[int, Polygon]]
-    ) -> tuple[float, int] | None:
-        # 先固定原滑动的最小平移量，补滑不能反过来改变已可用的主轨迹。
+        pos: Position, rot: Vector, f_dir: Vector, band: Polygon, tail_zones: list[tuple[int, Polygon]], base_ts: int
+    ) -> tuple[float, int, int] | None:
+        def inside_band(offsets, shift, tail_direction=-1):
+            points = [flick_pos(pos, off, rot, f_dir, shift, tail_direction) for off in offsets]
+            if guard:
+                return bool(intersects_xy(band, [p.real for p in points], [p.imag for p in points]).all())
+            return all(band.intersects(Point(p.real, p.imag)) for p in points)
+
+        # 先固定原滑动的最小平移量
         for step in range(0, 16):
             for sign in ((1,) if step == 0 else (-1, 1)):
                 shift = sign * step * screen.flick_radius * 0.1
-                if not all(
-                    band.intersects(Point(p.real, p.imag))
-                    for p in (flick_pos(pos, off, rot, f_dir, shift) for off in flick_main_offsets)
+                if not inside_band(flick_main_offsets, shift):
+                    continue
+                if guard and any(
+                    intersects_xy(guard.mask((base_ts + off) / 1000), p.real, p.imag)
+                    for off in flick_main_offsets
+                    for p in (flick_pos(pos, off, rot, f_dir, shift),)
                 ):
                     continue
-                # 角落可折返；转动的线则比较补滑时真正的判定带覆盖。
+                # 转动的线则比较补滑时判定带覆盖
                 best = None
                 for tail_direction in (-1, 1):
-                    if not all(
-                        band.intersects(Point(p.real, p.imag))
-                        for p in (flick_pos(pos, off, rot, f_dir, shift, tail_direction) for off in flick_eval_offsets)
-                    ):
+                    release = flick_release
+                    if guard:
+                        release = flick_end
+                        for off in flick_eval_offsets:
+                            if off <= flick_end:
+                                continue
+                            p = flick_pos(pos, off, rot, f_dir, shift, tail_direction)
+                            if (
+                                not intersects_xy(band, p.real, p.imag)
+                                or intersects_xy(guard.mask((base_ts + off) / 1000), p.real, p.imag)
+                            ):
+                                break
+                            release = off
+                    elif not inside_band(flick_eval_offsets, shift, tail_direction):
                         continue
                     coverage = sum(
                         zone.intersects(Point(p.real, p.imag))
                         for off, zone in tail_zones
+                        if off <= release
                         for p in (flick_pos(pos, off, rot, f_dir, shift, tail_direction),)
                     )
                     if best is None or coverage > best[0]:
-                        best = (coverage, tail_direction)
+                        best = (coverage, tail_direction, release)
                 if best is not None:
-                    return shift, best[1]
+                    return shift, best[1], best[2]
         return None
     
     frames: defaultdict[int, list[SemiNote]] = defaultdict(list)
@@ -465,6 +494,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         dense_frame_sizes[ts] += 1
                     case NoteType.DRAG:
                         poly = judge_zone(line.pos(adj_time, note.offset), adj_rot, JUDGE_HALF_DRAG)
+                        if guard:
+                            poly = guard.clip(poly, adj_time)
                         sn = SemiNote(SemiNoteType.DRAG, adj_pos, current_note_id, adj_rot)
                         sweep_registry[ts].append(SweepTarget(sn, poly))
                     case NoteType.FLICK:
@@ -476,29 +507,38 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                         frames[ts].append(SemiNote(SemiNoteType.HOLD_START, adj_pos, current_note_id, adj_rot))
                         dense_frame_sizes[ts] += 1
                         p_touch = adj_pos
-                        for off in range(1, hold_ms, sample_delay):
+                        for off in range(1, max(1, hold_ms - 1) if guard else hold_ms, sample_delay):
                             t = ((ts + off) // sample_delay) * sample_delay
                             t = max(ts, min(t, ts + hold_ms)) / 1000.0
                             ang = line.angle @ t
                             rot_t = cmath.exp(ang * 1j)
                             pos = line.pos(t, adj_offset)
                             valid_zone_t = judge_zone(pos, rot_t)
+                            if guard:
+                                valid_zone_t = guard.clip(valid_zone_t, t)
+                                if not zone_ok(valid_zone_t):
+                                    raise BlockPlanningError(f'Hold has no unblocked region at {t:.3f}s')
                             p_touch = pos
                             if not valid_zone_t.is_empty:
                                 orig_point = Point(pos.real, pos.imag)
                                 p_touch = Position(nearest_points(valid_zone_t, orig_point)[0].x, nearest_points(valid_zone_t, orig_point)[0].y)
                             sn = SemiNote(SemiNoteType.HOLD, p_touch, current_note_id, rot_t)
                             sweep_registry[int(round(t * 1000))].append(SweepTarget(sn, valid_zone_t))
-                        t2 = (ts + hold_ms) / 1000.0
+                        end_ts = ts + max(1, hold_ms - 1) if guard else ts + hold_ms
+                        t2 = end_ts / 1000.0
                         rot2 = cmath.exp((line.angle @ t2) * 1j)
                         end_pos = p_touch
                         end_pos_raw = line.pos(t2, adj_offset)
                         valid_zone_end = judge_zone(end_pos_raw, rot2)
+                        if guard:
+                            valid_zone_end = guard.clip(valid_zone_end, t2)
+                            if not zone_ok(valid_zone_end):
+                                raise BlockPlanningError(f'Hold has no unblocked tail at {t2:.3f}s')
                         if not valid_zone_end.is_empty:
                             orig_point_end = Point(end_pos_raw.real, end_pos_raw.imag)
                             end_pos = Position(nearest_points(valid_zone_end, orig_point_end)[0].x, nearest_points(valid_zone_end, orig_point_end)[0].y)
-                        frames[ts + hold_ms].append(SemiNote(SemiNoteType.HOLD_END, end_pos, current_note_id, rot2))
-                        dense_frame_sizes[ts + hold_ms] += 1
+                        frames[end_ts].append(SemiNote(SemiNoteType.HOLD_END, end_pos, current_note_id, rot2))
+                        dense_frame_sizes[end_ts] += 1
 
                 current_note_id += 1
                 progress.advance(task1, 1)
@@ -542,6 +582,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     if not target.is_swept:
                         candidates_targets.append((base_ts + off, target, off))
             candidate_dirs = [flick_dir, -flick_dir]
+            if guard:
+                candidate_dirs.extend((flick_dir * 1j, -flick_dir * 1j))
             for tick_ts, target, off in candidates_targets:
                 rate = flick_rate(off)
                 if abs(rate) < 1e-3: 
@@ -549,9 +591,12 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 vec = (target.note.position - base_pos) / (base_rot * screen.flick_radius * rate)
                 if abs(vec) > 0:
                     candidate_dirs.append(vec / abs(vec))
+            if guard:
+                candidate_dirs = [direction * scale for scale in (1.0, 0.75, 0.5) for direction in candidate_dirs]
             best_dir = flick_dir
             best_shift = 0.0
             best_tail_direction = -1
+            best_release = flick_release
             max_swept = -1
             best_swept_targets = []
             flick_band = judge_zone(base_pos, base_rot, JUDGE_HALF_DRAG, JUDGE_MARGIN * FLICK_LATERAL)
@@ -564,10 +609,10 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     rot_tail = cmath.exp((line.angle @ t_tail) * 1j)
                     tail_zones.append((off, judge_zone(line.pos(t_tail, note_id_to_offset[nid]), rot_tail, JUDGE_HALF_DRAG)))
             for c_dir in candidate_dirs:
-                fitted = fit_flick(base_pos, base_rot, c_dir, flick_band, tail_zones)
+                fitted = fit_flick(base_pos, base_rot, c_dir, flick_band, tail_zones, base_ts)
                 if fitted is None:
                     continue
-                shift, tail_direction = fitted
+                shift, tail_direction, release = fitted
                 current_swept = []
                 for off in flick_main_offsets:
                     tick_ts = base_ts + off
@@ -581,20 +626,25 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     best_dir = c_dir
                     best_shift = shift
                     best_tail_direction = tail_direction
+                    best_release = release
                     best_swept_targets = current_swept
             if max_swept == -1:
                 console.print(f"[red]滑动轨迹出屏：note @ {base_ts} (pos={base_pos})[/red]")
+                if guard:
+                    raise BlockPlanningError(f'No unblocked Flick path at {base_ts / 1000:.3f}s')
             for target in best_swept_targets:
                 target.is_swept = True
             for off in flick_eval_offsets:
+                if off > best_release:
+                    break
                 tick_ts = base_ts + off
                 p_flick = flick_pos(base_pos, off, base_rot, best_dir, best_shift, best_tail_direction)
                 if off == flick_start:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_START, p_flick, nid, base_rot))
+                elif off == best_release:
+                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_TAIL_END, p_flick, nid, base_rot))
                 elif off == flick_end:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_END, p_flick, nid, base_rot))
-                elif off == flick_release:
-                    frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_TAIL_END, p_flick, nid, base_rot))
                 elif off > flick_end:
                     frames[tick_ts].append(SemiNote(SemiNoteType.FLICK_TAIL, p_flick, nid, base_rot))
                 else:
@@ -690,6 +740,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         result: defaultdict[int, list[VirtualTouchEvent]] = defaultdict(list)
         pointer_pos: dict[PointerID, Position] = {}
         for timestamp, frame in sorted_frames:
+            frame_zones = (
+                {target.note.id: target.poly for target in sweep_registry.get(timestamp, ())} if guard else {}
+            )
             to_free: list[SemiNote] = []
             must_notes: list[SemiNote] = []
             may_notes: list[SemiNote] = []
@@ -739,8 +792,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                             own = intersection(own, active_polys[m])
                         rest = [j for j in range(len(must_notes)) if j not in members]
                         free = difference(own, union_all([exclude_polys[j] for j in rest]))
-                        # 避让必须用真实判定带的并集，不能退回缩窄的规划区。
-                        # 否则多个触点会互抢同一颗 Tap，剩余触点还可能抢到下一拍。
+                        # 避让用判定带的并集，否则多触点会一起抢一个tap
                         if zone_ok(free):
                             zones.append(free)
                             continue
@@ -792,6 +844,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 if pid is None:
                     continue
                 result[timestamp].append(VirtualTouchEvent(target, TouchAction.DOWN, pid))
+                if guard:
+                    guard.protect(pid, timestamp, timestamp + down_window(note.type))
                 if note.type == SemiNoteType.TAP:
                     to_free.append(note)
                 confirmed_pointers[pid] = target
@@ -805,6 +859,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
                 poly_n = judge_zone(note.position, note.rotation, JUDGE_HALF_DRAG)
+                if guard:
+                    poly_n = guard.clip(poly_n, t_sec)
                 candidates = []
                 covering_pid = None
                 covering_pos = None
@@ -835,6 +891,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     confirmed_pointers[pid] = note.position
                     current_touches[pid] = note.position
                     flicking_pids.add(pid)
+                if guard:
+                    guard.protect(covering_pid if covering_pid is not None else pid, timestamp, timestamp + sample_delay)
             for note in active_never:
                 if note.id in pointers.cancelled_flicks:
                     continue
@@ -845,6 +903,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     if pid is None:
                         continue
                     result[timestamp].append(VirtualTouchEvent(note.position, TouchAction.MOVE, pid))
+                    if guard:
+                        guard.protect(pid, timestamp, timestamp + sample_delay)
                     if note.type == SemiNoteType.FLICK_TAIL_END:
                         to_free.append(note)
                     confirmed_pointers[pid] = note.position
@@ -854,6 +914,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             drag_notes = [n for n in passive_notes if n.type == SemiNoteType.DRAG]
 
             def bind_holds(pid: PointerID, pos: Position, notes: list[SemiNote]) -> None:
+                if guard:
+                    guard.protect(pid, timestamp, timestamp + sample_delay)
                 for n in notes:
                     old = pointers.occupied.get(n.id)
                     if old is not None and old.id != pid:
@@ -870,7 +932,9 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
             # 一帧内所有Hold一起做覆盖
             # 否则像 RetributionSP，每条 Hold 都要一个指针就完蛋了
             if hold_notes:
-                hold_polys = {n.id: note_zone(n, t_sec) for n in hold_notes}
+                hold_polys = {
+                    n.id: frame_zones[n.id] if n.id in frame_zones else note_zone(n, t_sec) for n in hold_notes
+                }
                 pending = [n for n in hold_notes if zone_ok(hold_polys[n.id])]
                 groups: list[tuple[list[SemiNote], Polygon, PointerID | None]] = []
                 for pid in downed_pids:
@@ -956,7 +1020,7 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     used_pids.add(pid)
 
             for note in drag_notes:
-                poly_n = note_zone(note, t_sec, JUDGE_HALF_DRAG)
+                poly_n = frame_zones[note.id] if note.id in frame_zones else note_zone(note, t_sec, JUDGE_HALF_DRAG)
                 covering_pid = None
                 covering_pos = None
                 for pid, p_touch in current_touches.items():
@@ -967,6 +1031,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                 line_ref = note_id_to_line.get(note.id)
                 offset_val = note_id_to_offset.get(note.id, 0.0)
                 if covering_pid is not None:
+                    if guard:
+                        guard.protect(covering_pid, timestamp, timestamp + 1)
                     # unused 随时可能被拿走，需要临时occupied一下
                     if covering_pid in pointers.unused:
                         del pointers.unused[covering_pid]
@@ -985,6 +1051,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
                     continue
                 act = TouchAction.DOWN if is_down else TouchAction.MOVE
                 result[timestamp].append(VirtualTouchEvent(note.position, act, pid))
+                if guard:
+                    guard.protect(pid, timestamp, timestamp + 1)
                 to_free.append(note)
                 confirmed_pointers[pid] = note.position
                 current_touches[pid] = note.position
@@ -1004,6 +1072,8 @@ def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[S
         result[up_ts].append(VirtualTouchEvent(ptr.position, TouchAction.UP, ptr.id))
     
     console.print(f'重构规划完毕，总事件数{sum(len(events) for events in result.values())}.')
+    if guard:
+        return screen, guard.finish(result, console)
     return screen, [(ts, events) for ts, events in sorted(result.items())]
 
 __all__ = ['solve']

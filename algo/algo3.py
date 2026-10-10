@@ -344,6 +344,11 @@ class PointerAllocator:
 
 
 def solve(chart: Chart, _: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
+    if chart.block_areas:
+        from .algo4 import solve as solve_regions
+        from .blocks import compatible_config
+        console.print('噪域使用区域规划')
+        return solve_regions(chart, compatible_config(_, 3), console)
     flick_duration = 3
     flick_direction = 0
     screen = ScreenUtil(chart.width, chart.height)

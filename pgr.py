@@ -1,7 +1,8 @@
-from typing import TypedDict, Required
+from typing import TypedDict, Required, NotRequired
 import math
 from basis import NoteType, Note, JudgeLine, Position, Chart, VisualNote
 from bamboo import Bamboo, EventBamboo, IntegratedBamboo
+from block_area import BlockAreas
 import cmath
 
 
@@ -35,6 +36,7 @@ class PgrChartDict(TypedDict):
     formatVersion: int
     offset: float
     judgeLineList: list[PgrJudgeLineDict]
+    blockAreaList: NotRequired[list[dict]]
 
 
 PGR_NOTE_TYPES: list[NoteType] = [NoteType.UNKNOWN, NoteType.TAP, NoteType.DRAG, NoteType.HOLD, NoteType.FLICK]
@@ -165,6 +167,7 @@ class PgrChart(Chart):
     def __init__(self, dic: PgrChartDict, ratio: tuple[int, int]) -> None:
         super().__init__()
         self.width, self.height = ratio
+        self.block_areas = BlockAreas(dic.get('blockAreaList') or (), *ratio)
         self.format = 'pgr'
         version = dic['formatVersion']
         self.offset = dic.get('offset', 0.0)

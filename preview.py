@@ -140,6 +140,47 @@ class ChartRenderer:
                 canvas.drawRect(skia.Rect.MakeXYWH(-length, -s.height * 0.00375, length * 2, s.height * 0.0075), paint)
         canvas.restore()
 
+    def draw_blocks(s, canvas, seconds):
+        from block_area import compose
+
+        blocks = s.chart.block_areas
+        if not blocks:
+            return
+
+        def path_for(geometry):
+            path = skia.Path()
+            path.setFillType(skia.PathFillType.kEvenOdd)
+            polygons = [geometry] if geometry.geom_type == 'Polygon' else getattr(geometry, 'geoms', ())
+            for polygon in polygons:
+                if polygon.geom_type != 'Polygon':
+                    continue
+                for ring in (polygon.exterior, *polygon.interiors):
+                    coords = list(ring.coords)
+                    path.moveTo(*coords[0])
+                    for point in coords[1:]:
+                        path.lineTo(*point)
+                    path.close()
+            return path
+
+        canvas.save()
+        canvas.scale(*s.sc)
+        active = compose(blocks.active(seconds))
+        if not active.is_empty:
+            canvas.drawPath(path_for(active), make_paint((240, 55, 70), 0.45))
+            border = make_paint((255, 100, 110), 0.9)
+            border.setStyle(skia.Paint.kStroke_Style)
+            border.setStrokeWidth(2 / s.sc[0])
+            canvas.drawPath(path_for(active), border)
+        for area in blocks.visible_areas(seconds):
+            phase = area.phase(seconds)
+            if phase not in ('ready', 'disabled'):
+                continue
+            outline = make_paint((255, 190, 100) if phase == 'ready' else (145, 155, 175), 0.7 if phase == 'ready' else 0.3)
+            outline.setStyle(skia.Paint.kStroke_Style)
+            outline.setStrokeWidth(1.5 / s.sc[0])
+            canvas.drawPath(path_for(area.rectangle(seconds).polygon()), outline)
+        canvas.restore()
+
     def draw(s, canvas, seconds):
         for line in s.lines:
             s.draw_line(canvas, line, seconds)
@@ -182,6 +223,7 @@ class ChartRenderer:
                     draw_center_rotate_round_rect(
                         canvas, hx, hy, note_width, head_height, head_height / 4, head_height / 4, rotation, paint
                     )
+        s.draw_blocks(canvas, seconds)
 
 
 def pg():

@@ -1,6 +1,7 @@
 from abc import ABCMeta, abstractmethod
 from enum import IntEnum
 from bamboo import Bamboo, BambooShoot
+from block_area import BlockAreas
 from typing import TypeAlias, NamedTuple
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,3 +152,4 @@ class Chart(metaclass=ABCMeta):
     def __init__(self) -> None:
         self.warnings: list[str] = []
         self.source: Path | None = None
+        self.block_areas = BlockAreas()

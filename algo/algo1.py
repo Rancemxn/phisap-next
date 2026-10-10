@@ -139,6 +139,11 @@ class PointerManager:
 
 
 def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
+    if chart.block_areas:
+        from .algo4 import solve as solve_regions
+        from .blocks import compatible_config
+        console.print('噪域使用区域规划')
+        return solve_regions(chart, compatible_config(config, 1), console)
     # 根据目标分数要求预处理谱面
     chart = preprocess(chart, config['algo1_target_score'], config['algo1_strict_mode'])
     

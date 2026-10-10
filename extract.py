@@ -975,5 +975,29 @@ class AssetsManager:
             self.asset_files.append(asset_file)
             self.asset_file_hashes.append(asset_file.path.name)
 
+
+def iter_chart_texts(package, entries):
+    bundles = {}
+    for asset_name, filename in entries:
+        bundles.setdefault(filename, []).append(asset_name)
+    for filename, names in bundles.items():
+        manager = AssetsManager()
+        with package.open('assets/aa/Android/' + filename) as stream:
+            manager.load_file(stream)
+        texts = []
+        for asset in manager.asset_files:
+            for info in asset.object_infos:
+                if info.class_id == ClassID.TEXT_ASSET:
+                    with ObjectReader(asset.reader, asset, info) as reader:
+                        texts.append(TextAsset(reader))
+        for name in dict.fromkeys(names):
+            matches = [text for text in texts if text.name == pathlib.PurePosixPath(name).stem]
+            if len(matches) == 1:
+                yield name, matches[0].text
+            elif len(texts) == 1 and len(names) == 1:
+                yield name, texts[0].text
+            else:
+                raise ValueError(f'Cannot identify chart TextAsset: {name} ({filename})')
+
 if __name__ == '__main__':
     pass

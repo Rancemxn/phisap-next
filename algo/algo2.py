@@ -220,6 +220,11 @@ class PointerAllocator:
 
 
 def solve(chart: Chart, config: AlgorithmConfigure, console: Console) -> tuple[ScreenUtil, RawAnswerType]:
+    if chart.block_areas:
+        from .algo4 import solve as solve_regions
+        from .blocks import compatible_config
+        console.print('噪域使用区域规划')
+        return solve_regions(chart, compatible_config(config, 2), console)
     flick_start = config['algo2_flick_start']
     flick_end = config['algo2_flick_end']
     flick_direction = config['algo2_flick_direction']

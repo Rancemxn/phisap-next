@@ -27,7 +27,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QObject, QSettings
 
 from rich.console import Console
 from catalog import Catalog
-from extract import AssetsManager, TextAsset, ObjectReader, ClassID
+from extract import iter_chart_texts
 from algo.base import (
     AlgorithmConfigure,
     ScreenUtil,
@@ -51,56 +51,28 @@ class ExtractPackageWorker(QThread):
     running: bool
 
     def run(self) -> None:
-        self.running = True
-        package = zipfile.ZipFile(self.packagePath)
-        try:
-            catalog = Catalog(package.open('assets/aa/catalog.json'))
-        except KeyError:
-            # TODO: alert
-            print('???')
+        if not self.running:
             return
-
-        manager = AssetsManager()
-        files = package.namelist()
-        for index, file in enumerate(files):
-            self.processUpdate.emit(0, index, len(files))
-            if not self.running:
-                return
-            if not file.startswith('assets/aa/Android'):
-                continue
-            with package.open(file) as f:
-                manager.load_file(f)
-
-        files = manager.asset_files
-        for index, file in enumerate(files):
-            self.processUpdate.emit(1, index, len(files))
-            if not self.running:
-                return
-            for object_info in file.object_infos:
-                with ObjectReader(file.reader, file, object_info) as obj_reader:
-                    if obj_reader.class_id == ClassID.TEXT_ASSET:
-                        file.add_object(TextAsset(obj_reader))
-
-        files = manager.asset_files
-        for index, file in enumerate(files):
-            self.processUpdate.emit(2, index, len(files))
-            if not self.running:
-                return
-            assert file.parent
-            filepath = file.parent.reader.path
-            if filepath.name not in catalog.fname_map:
-                continue
-            asset_name = catalog.fname_map[filepath.name]
-            if not asset_name.startswith('Assets/'):
-                continue
-
-            for obj in file.objects:
-                if isinstance(obj, TextAsset):
-                    basedir = os.path.dirname(asset_name)
-                    if basedir and not os.path.exists(basedir):
-                        os.makedirs(basedir)
-                    with open(asset_name, 'w') as out:
-                        out.write(obj.text)
+        try:
+            with zipfile.ZipFile(self.packagePath) as package:
+                self.processUpdate.emit(0, 0, 0)
+                with package.open('assets/aa/catalog.json') as stream:
+                    entries = Catalog(stream).get_chart_entries()
+                if not entries:
+                    raise ValueError('No chart entries in the package catalog')
+                root = Path('Assets/Tracks').resolve()
+                self.processUpdate.emit(2, 0, len(entries))
+                for index, (asset_name, text) in enumerate(iter_chart_texts(package, entries), 1):
+                    if not self.running:
+                        return
+                    destination = Path(asset_name).resolve()
+                    if not destination.is_relative_to(root):
+                        raise ValueError(f'Invalid chart path: {asset_name}')
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(text, encoding='utf-8')
+                    self.processUpdate.emit(2, index, len(entries))
+        except Exception as error:
+            self.failure = error
 
     def cancel(self) -> None:
         self.running = False
@@ -108,6 +80,8 @@ class ExtractPackageWorker(QThread):
     def __init__(self, packagePath: str, parent: QObject) -> None:
         super().__init__(parent)
         self.packagePath = packagePath
+        self.running = True
+        self.failure: Exception | None = None
 
 class SolveWorker(QThread):
     solved = Signal(object, object)
@@ -719,14 +693,23 @@ class MainWindow(QWidget):
         self.extractProgressDialog.setValue(current)
 
     def onExtractFinished(self):
+        worker = self.extractPackageWorker
+        cancelled = worker is not None and not worker.running
         if self.extractProgressDialog:
             self.extractProgressDialog.close()
             self.extractProgressDialog = None
         self.extractButton.setDisabled(False)
-        box = QMessageBox()
-        box.setText(self.tr('Extract finished'))
-        box.exec()
         self.loadSongs()
+        if cancelled:
+            return
+        box = QMessageBox()
+        if worker and worker.failure is not None:
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setText(self.tr('Extract failed'))
+            box.setInformativeText(str(worker.failure))
+        else:
+            box.setText(self.tr('Extract finished'))
+        box.exec()
 
     def loadSongs(self) -> None:
         try:

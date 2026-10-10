@@ -3,7 +3,7 @@ import hashlib
 
 
 class CacheManager:
-    _CACHE_VERSION = b'chart-v2\0'
+    _CACHE_VERSION = b'chart-v3\0'
 
     def __init__(self, cache_dir: str | Path = './.cache.d') -> None:
         self.cache_dir = Path(cache_dir)

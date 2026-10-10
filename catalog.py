@@ -10,6 +10,7 @@ class Catalog:
     keys: list
     entries: list[dict]
     fname_map: dict[str, str]
+    bundle_names: dict[str, str]
 
     def __init__(self, file: IO) -> None:
         data = load(file)
@@ -65,10 +66,22 @@ class Catalog:
             for e in b['entries']:
                 self.entries[e]['keys'].append(k)
 
+        self.bundle_names = {}
+        for e in self.entries:
+            if e['provider'].endswith('.AssetBundleProvider'):
+                filename = e['internalId'].replace('\\', '/').rsplit('/', 1)[-1]
+                for key in (e['primaryKey'], *e['keys']):
+                    if isinstance(key, str):
+                        self.bundle_names[key] = filename
+
         self.fname_map = {}
         for e in self.entries:
             if isinstance(e['primaryKey'], str) and isinstance(e['dependencyKey'], str):
                 self.fname_map[e['dependencyKey']] = e['primaryKey']
+                self.fname_map[self.bundle_filename(e['dependencyKey'])] = e['primaryKey']
+
+    def bundle_filename(self, dependency_key: str) -> str:
+        return self.bundle_names.get(dependency_key, dependency_key)
 
     @classmethod
     def read_object(cls, reader: BinaryReader):
@@ -103,7 +116,7 @@ class Catalog:
             dk = e.get("dependencyKey")
             if isinstance(pk, str) and isinstance(dk, str):
                 if pk.startswith("Assets/Tracks/") and pk.endswith(".json"):
-                    result.append((pk, dk))
+                    result.append((pk, self.bundle_filename(dk)))
         return result
 
     def get_track_entries(self) -> list[tuple[str, str]]:
@@ -113,7 +126,7 @@ class Catalog:
             dk = e.get("dependencyKey")
             if isinstance(pk, str) and isinstance(dk, str):
                 if pk.startswith("Assets/Tracks/") or pk.startswith("avatar."):
-                    result.append((pk, dk))
+                    result.append((pk, self.bundle_filename(dk)))
         return result
 
 
