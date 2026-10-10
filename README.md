@@ -11,7 +11,7 @@
 
 **仅支持安卓设备**
 
-![最高支持](https://img.shields.io/badge/最高支持-Phigros%203.19.2-blue.svg)
+![最高支持](https://img.shields.io/badge/最高支持-Phigros%204.0.1-blue.svg)
 
 _phisap的图标由[@ShintoKosei](https://github.com/ShintoKosei)制作，授权给phisap项目使用，ShintoKosei保留所有权利_
 
